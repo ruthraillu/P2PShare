@@ -59,8 +59,8 @@ jobs:
       - name: Build Android ARM64 APK
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          P2PSHARE_ANDROID_SIGNING_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_SIGNING_KEY || '' }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') }}
+          P2PSHARE_ANDROID_SIGNING_KEY: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_SIGNING_KEY || '' }}
         run: |
           $env:RUSTUP_TOOLCHAIN = 'stable'
           if ($env:RELEASE_TAG -eq 'true') {
@@ -85,16 +85,17 @@ jobs:
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && 'android-arm64' || 'android-arm64-test' }}
+          name: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') && 'android-arm64' || 'android-arm64-test' }}
           path: releases/android/P2PShare-android-arm64.apk
           if-no-files-found: error
 
   publish-release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v')
     needs: [windows, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
