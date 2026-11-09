@@ -305,6 +305,19 @@ impl View {
                         self.design.signaling_setup = None;
                         self.design.notice.clear();
                     }
+                    Intent::DownloadUpdate => {
+                        if let Some(notice) = &mut self.design.update {
+                            self.updater.start_download(notice);
+                        }
+                    }
+                    Intent::InstallUpdate => match self.updater.install() {
+                        Ok(()) => self.close_requested = true,
+                        Err(error) => {
+                            if let Some(notice) = &mut self.design.update {
+                                notice.error = Some(error.to_string());
+                            }
+                        }
+                    },
                     Intent::Window(action) => self.window_action(action)?,
                     Intent::PopOut(peer) => self.popout_requests.push(peer),
                     Intent::Firewall => self.firewall.request(),

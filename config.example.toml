@@ -1,10 +1,93 @@
-# Display name sent to other room members (1..32 characters).
+# P2PShare defaults. Restart the app after manually editing config.toml.
+# Optional UI language. Unset until the first-run language choice.
+# language = "en"  # en or pt-BR
+
+# Optional profile image. Unset until the user picks an avatar.
+# avatar = "data/profile/avatar.jpg"
+
+# Write diagnostics to P2PShare.log.
+logging_enabled = true
+
+# Display name sent to room members (1..32 printable characters).
 username = ""
 
-# WebSocket signaling server. Use the same URL on every device.
-# Use wss:// for public servers; ws:// is permitted only on loopback for tests.
+# Use the same WebSocket signaling server on all devices.
+# Public endpoints use wss://. Plain ws:// is allowed for loopback tests only.
 signaling_url = ""
 
-# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.
+# Default room name (3..64 ASCII letters, numbers, spaces, hyphens or underscores).
 # Names are case-insensitive and repeated spaces are collapsed.
 room_name = ""
+
+# Whether the Windows first-run name setup has completed.
+profile_setup_complete = false
+
+# Playback volume change in percentage points per mouse-wheel tick (1..100).
+volume_step_percent = 2
+
+[stream]
+# Windows video codec. avc, hevc or auto.
+codec = "avc"
+# Encoder backend. auto, nvenc, amf, qsv or software.
+encoder = "auto"
+# Windows software codec threads per stream (1..8 or "auto").
+software_encode_threads = 2
+# Windows software decoder and hardware decoder fallback threads (1..8 or "auto").
+software_decode_threads = "auto"
+# Video bitrate in kilobits per second (100..50000).
+bitrate_kbps = 8000
+# Target frame rate (1..120).
+fps = 30
+# Maximum even output dimensions. Capture aspect ratio is preserved.
+width = 1920
+height = 1080
+# Include the mouse pointer in Windows shares and previews.
+show_cursor = true
+# Log individual frame timings.
+log_per_frame = false
+# Preview refresh interval in seconds (10..60).
+preview_interval_secs = 10
+
+[audio]
+# Share selected app audio, or desktop sound for a display share.
+enabled = true
+# Stereo Opus bitrate in kilobits per second (64..512).
+bitrate_kbps = 192
+# Audio receive jitter buffer in milliseconds (10..100).
+playback_buffer_ms = 30
+
+[playback]
+# Extra synchronized audio/video playback delay in milliseconds (0..1000).
+buffer_ms = 0
+
+[audio_exclusions]
+# Windows display shares only. Exclude the processes below when enabled.
+enabled = false
+# Executable filenames to exclude, matched case-insensitively.
+processes = ["discord.exe", "serein.exe"]
+
+[theme]
+# Workspace background.
+background = "#15161C"
+# Room and member sidebar.
+sidebar = "#1C1E27"
+# Cards and input surfaces.
+surface = "#252833"
+# Hovered controls.
+hover = "#323644"
+# Dividers and outlines.
+border = "#373C4C"
+# Primary text.
+text = "#F3F4FA"
+# Secondary text.
+muted = "#AFB5C7"
+# Primary actions and selections.
+accent = "#959AFF"
+# Text on accent.
+accent_text = "#15162C"
+# Connected indicators.
+success = "#65D9A7"
+# Stop and error indicators.
+danger = "#FF97A4"
+# Video letterbox background.
+video = "#101117"

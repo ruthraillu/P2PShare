@@ -284,6 +284,7 @@ impl ApplicationHandler for Runner {
 struct View {
     window: Window,
     close_requested: bool,
+    updater: crate::updater::Updater,
     popout_requests: Vec<u64>,
     maximized_before_fullscreen: bool,
     window_memory: crate::window_memory::WindowMemory,
@@ -489,6 +490,7 @@ impl View {
         let mut view = Self {
             window,
             close_requested: false,
+            updater: crate::updater::Updater::new(p2pshare_media::portable::data_dir()?, !smoke && !capture_smoke),
             popout_requests: Vec::new(),
             maximized_before_fullscreen: false,
             window_memory,
@@ -1042,6 +1044,7 @@ impl View {
         let legacy = self.smoke || self.capture_smoke;
         if !legacy {
             self.sync_design();
+            self.updater.poll(&mut self.design.update);
         }
         let output = self
             .ctx
@@ -1054,7 +1057,7 @@ impl View {
                         ui.ctx(),
                         self.hwnd.0 as usize,
                         self.design.dialog == p2pshare_desktop_design::app::Dialog::None
-                            && !self.design.fullscreen,
+                            && !self.design.fullscreen && !self.design.update_open,
                     );
                 }
             });

@@ -117,6 +117,8 @@ pub const SOURCES: [Source; 6] = [
 pub enum Intent {
     Language(p2pshare_media::i18n::Language),
     SetSignalingServer(String),
+    DownloadUpdate,
+    InstallUpdate,
     Save(Box<Config>),
     ChooseAvatar,
     SaveAvatar(Option<Vec<u8>>),
@@ -132,6 +134,8 @@ pub enum Intent {
 pub struct App {
     pub language_prompt:bool,
     pub signaling_setup: Option<String>,
+    pub update: Option<crate::updates::Notice>,
+    pub update_open: bool,
     pub avatars:HashMap<u64,egui::TextureId>,
     pub profile_view:Option<u64>,
     pub profile_names:HashMap<u64,Vec<String>>,
@@ -224,6 +228,8 @@ impl App {
         Self {
             language_prompt:false,
             signaling_setup: None,
+            update: None,
+            update_open: false,
             profile_view:None,profile_names:Default::default(),profile_images:Default::default(),profile_history_textures:Vec::new(),profile_history_key:None,profile_show_names:false,profile_enlarged:None,
             avatars:Default::default(),avatar_data:Default::default(),crop:None,pending_avatar:None,profile_preview:None,
             live: false,
@@ -551,6 +557,7 @@ impl App {
         }
         self.draw_dialog(ui.ctx());
         self.draw_profile_viewer(ui.ctx());
+        self.draw_update_dialog(ui);
         if !self.fullscreen {
             self.window_chrome(ui.ctx(), viewport);
         }

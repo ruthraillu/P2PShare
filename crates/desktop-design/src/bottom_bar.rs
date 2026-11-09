@@ -9,6 +9,7 @@ enum Icon {
     Monitor,
     Speaker(bool),
     Leave,
+    Download,
 }
 #[derive(Clone, Copy)]
 enum Tone {
@@ -74,6 +75,18 @@ fn draw_icon(ui: &Ui, area: Rect, icon: Icon, color: Color32) {
                 .line_segment([c + vec2(-4., 8.), c + vec2(4., 8.)], stroke);
         }
         Icon::Speaker(muted) => crate::icons::speaker(ui, area, color, muted),
+        Icon::Download => {
+            for (a, b) in [
+                ((0., -7.), (0., 3.)),
+                ((-4., -1.), (0., 3.)),
+                ((0., 3.), (4., -1.)),
+                ((-6., 3.), (-6., 7.)),
+                ((-6., 7.), (6., 7.)),
+                ((6., 7.), (6., 3.)),
+            ] {
+                ui.painter().line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], stroke);
+            }
+        }
         Icon::Leave => {
             ui.painter().add(egui::epaint::PathShape::line(
                 [(-1., -7.), (-8., -7.), (-8., 7.), (-1., 7.)]
@@ -326,6 +339,21 @@ impl App {
         {
             for member in self.members.iter_mut().skip(1) {
                 member.muted = !all;
+            }
+        }
+        if let Some(phase) = self.update.as_ref().map(|update| update.phase) {
+            let right = r.right() - 134.;
+            let available = right - mute.right() - 10.;
+            let width = if available >= 180. { 180. } else { 32. };
+            if available >= width {
+                let area = rect(right - width, y, width, 32.);
+                let title = phase.label();
+                if self.bar_button(ui, "update", area, if width > 32. { title } else { "" }, Icon::Download, Tone::Selected) {
+                    self.update_open = true;
+                }
+                if width == 32. {
+                    ui.interact(area, Id::new("update-tooltip"), Sense::hover()).on_hover_text(title);
+                }
             }
         }
         if self.bar_button(

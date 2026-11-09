@@ -30,6 +30,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable build --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop -j 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable test --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop-design --lib -j 1 updates::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable test --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop-ui --lib -j 1 updater::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Path ci-out | Out-Null
           Copy-Item '.build/target/x86_64-pc-windows-msvc/release/P2PShare.exe' 'ci-out/P2PShare.exe'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -62,3 +66,51 @@ jobs:
           name: android-arm64-test
           path: releases/android/P2PShare-android-arm64.apk
           if-no-files-found: error
+
+  publish-windows:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-x64
+          path: release-out
+      - name: Sign and publish the Windows update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2PSHARE_WINDOWS_SIGNING_KEY: ${{ secrets.P2PSHARE_WINDOWS_SIGNING_KEY }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && "$TAG" == "v$version" ]] || {
+            echo "The release tag must match the stable workspace version." >&2
+            exit 1
+          }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Check its assets before retrying." >&2
+            exit 1
+          fi
+          [[ -n "$P2PSHARE_WINDOWS_SIGNING_KEY" ]] || {
+            echo "Missing Windows release signing secret." >&2
+            exit 1
+          }
+          umask 077
+          key="$(mktemp "$RUNNER_TEMP/p2pshare-key.XXXXXX")"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$P2PSHARE_WINDOWS_SIGNING_KEY" | base64 --decode > "$key"
+          unset P2PSHARE_WINDOWS_SIGNING_KEY
+          exe=release-out/P2PShare.exe
+          read -r hash _ < <(sha256sum "$exe")
+          size="$(stat -c '%s' "$exe")"
+          printf 'P2PShare Windows x64 update v1\n%s\n%s\n%s\n' "$version" "$hash" "$size" > release-out/signing-message
+          openssl pkeyutl -sign -rawin -inkey "$key" -in release-out/signing-message -out "$exe.sig"
+          [[ "$(stat -c '%s' "$exe.sig")" == "64" ]]
+          gh release create "$TAG" "$exe" "$exe.sig" --verify-tag --title "P2PShare $TAG" --generate-notes --latest

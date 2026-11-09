@@ -17,3 +17,4 @@ mod bottom_bar;
 pub mod profile;
 
 mod language;
+pub mod updates;

@@ -5,6 +5,10 @@ use std::{
 };
 fn main() -> std::process::ExitCode {
     #[cfg(windows)]
+    if let Some(code) = p2pshare_desktop_ui::update_command_mode() {
+        return code;
+    }
+    #[cfg(windows)]
     if let Some(code) = p2pshare_desktop_ui::firewall_command_mode() {
         return code;
     }
