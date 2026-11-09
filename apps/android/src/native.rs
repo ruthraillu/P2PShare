@@ -80,6 +80,7 @@ struct PlatformInput {
     pip_closed: bool,
     insets: [f32; 4],
     repaint: Option<egui::Context>,
+    available_update: Option<semver::Version>,
 }
 static PLATFORM_INPUT: OnceLock<Mutex<PlatformInput>> = OnceLock::new();
 fn platform_input() -> &'static Mutex<PlatformInput> {
@@ -95,6 +96,29 @@ pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeVideoReady(
         ctx.request_repaint();
     }
 }
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeReleaseMetadata(
+    mut env: JNIEnv,
+    _class: JClass,
+    metadata: JString,
+) {
+    let Ok(metadata) = env.get_string(&metadata) else {
+        return;
+    };
+    let metadata: String = metadata.into();
+    let Some(version) = crate::release_update::available(&metadata, &crate::release_update::installed()) else {
+        return;
+    };
+    let repaint = {
+        let mut platform = platform_input().lock().unwrap();
+        platform.available_update = Some(version);
+        platform.repaint.clone()
+    };
+    if let Some(ctx) = repaint {
+        ctx.request_repaint();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeBack(
     _env: JNIEnv,
@@ -213,6 +237,26 @@ struct Bridge {
     activity: GlobalRef,
 }
 impl Bridge {
+    fn check_for_update(&self) {
+        let _ = self.env(|env| {
+            env.call_method(self.activity.as_obj(), "checkForUpdate", "()V", &[])?;
+            Ok(())
+        });
+    }
+
+    fn open_update_page(&self, version: &semver::Version) {
+        let _ = self.env(|env| {
+            let url = env.new_string(crate::release_update::page(version))?;
+            env.call_method(
+                self.activity.as_obj(),
+                "openUpdatePage",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(url.as_ref())],
+            )?;
+            Ok(())
+        });
+    }
+
     fn update_pip(&self, active: bool, width: u32, height: u32) {
         let _=self.env(|env| {env.call_method(self.activity.as_obj(),"updatePip","(ZII)V",&[JValue::Bool(active as u8),JValue::Int(width as i32),JValue::Int(height as i32)])?;Ok(())});
     }
@@ -492,6 +536,7 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
             Box::new(move |cc| {
                 RoomUi::configure(&cc.egui_ctx);
                 platform_input().lock().unwrap().repaint = Some(cc.egui_ctx.clone());
+                bridge.check_for_update();
                 let gl = cc.gl.clone().ok_or("OpenGL ES unavailable")?;
                 let gpu = Gpu::new(gl)?;
                 let mut room = RoomUi::new(true);
@@ -517,6 +562,7 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
                     bridge,
                     gpu,
                     diagnostics_at: std::time::Instant::now(),
+                    available_update: None,
                     resume_epoch: RESUME_EPOCH.load(Ordering::Acquire),
                     preview_textures: HashMap::new(),
                 }))
@@ -618,6 +664,7 @@ struct AndroidUi {
     _audio: audio::AudioReceiver,
     gpu: Gpu,
     diagnostics_at: std::time::Instant,
+    available_update: Option<semver::Version>,
     resume_epoch: u64,
     preview_textures: HashMap<String, egui::TextureHandle>,
 }
@@ -628,6 +675,10 @@ impl eframe::App for AndroidUi {
             self.room
                 .set_safe_insets(platform.insets.map(|px| px / ui.ctx().pixels_per_point()));
             self.room.pip_mode=platform.pip;
+            if let Some(version) = platform.available_update.take() {
+                self.room.android_update_version = Some(version.to_string());
+                self.available_update = Some(version);
+            }
             if std::mem::take(&mut platform.pip_closed) {
                 self.room.watching.clear();self.room.focused=None;self.room.back();
             }
@@ -762,6 +813,11 @@ impl eframe::App for AndroidUi {
         let actions = self.room.ui(ui);
         for action in actions {
             match action {
+                Action::ViewAndroidUpdate => {
+                    if let Some(version) = &self.available_update {
+                        self.bridge.open_update_page(version);
+                    }
+                }
                 Action::SetLanguage(language)=>{
                     let result=(||->anyhow::Result<()>{let path=CONFIG_PATH.get().ok_or_else(||anyhow::anyhow!("Config unavailable"))?;let mut config=p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;config.language=Some(language);let pending=path.with_extension("toml.pending");std::fs::write(&pending,config.document()?)?;std::fs::rename(pending,path)?;Ok(())})();
                     if let Err(error)=result{self.room.language_prompt=true;self.room.status=format!("Could not save language: {error}");}

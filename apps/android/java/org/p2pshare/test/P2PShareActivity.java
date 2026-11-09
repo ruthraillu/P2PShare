@@ -11,6 +11,33 @@ import android.content.ClipData;
 /** Minimal Java shell for Android consent, clipboard and platform codecs; the UI is Rust egui. */
 public final class P2PShareActivity extends NativeActivity {
     private final AudioPlayback audioPlayback=new AudioPlayback(this);
+    private boolean updateCheckStarted;
+
+    private static native void nativeReleaseMetadata(String metadata);
+
+    public synchronized void checkForUpdate() {
+        if (updateCheckStarted) return;
+        updateCheckStarted = true;
+        new Thread(() -> {
+            try {
+                String metadata = ReleaseUpdates.fetchLatest();
+                if (metadata != null) nativeReleaseMetadata(metadata);
+            } catch (java.io.IOException error) {
+                DebugLog.record("android_update_check_failed=" + error.getClass().getSimpleName());
+            }
+        }, "p2pshare-update-check").start();
+    }
+
+    public void openUpdatePage(String url) {
+        runOnUiThread(() -> {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+            } catch (ActivityNotFoundException error) {
+                android.widget.Toast.makeText(this, L10n.t("Could not open the release page."),
+                    android.widget.Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
     public int audioAvailable(){return audioPlayback.available();}
     public int writeAudio(short[] samples){return audioPlayback.write(samples);}
     public void closeAudio(){audioPlayback.close();}

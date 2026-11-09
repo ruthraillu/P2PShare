@@ -50,6 +50,9 @@ impl RoomUi {
             ui.visuals_mut().override_text_color=Some(egui::Color32::from_rgb(243,244,250));
             ui.visuals_mut().extreme_bg_color=PANEL;
             egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|{
+                if !self.in_room || self.room_dialog {
+                    self.android_update_notice(ui, actions);
+                }
                 if self.signaling_setup {
                     ui.heading(p2pshare_media::tr!("Signaling server"));
                     ui.label(RichText::new(p2pshare_media::tr!("Enter the WebSocket URL your group uses.")).color(MUTED));
@@ -97,6 +100,23 @@ impl RoomUi {
         });
         true
     }
+    fn android_update_notice(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let Some(version) = self.android_update_version.as_deref() else { return };
+        let label = format!(
+            "{} · v{}  ›  {}",
+            p2pshare_media::tr!("Update available"),
+            version,
+            p2pshare_media::tr!("View release")
+        );
+        let button = egui::Button::new(RichText::new(label).size(13.0).color(ACCENT))
+            .fill(PANEL)
+            .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
+        if ui.add_sized([ui.available_width(), 40.0], button).clicked() {
+            actions.push(Action::ViewAndroidUpdate);
+        }
+        ui.add_space(6.0);
+    }
+
     fn mobile_landscape_settings(&mut self,ui:&mut Ui,actions:&mut Vec<Action>) {
         ui.spacing_mut().interact_size.y=28.0;
         for index in 0..if self.capture_supported&&self.in_room{5}else{4} {

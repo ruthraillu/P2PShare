@@ -3821,6 +3821,8 @@ dependencies = [
  "p2pshare-media",
  "p2pshare-room-ui",
  "p2pshare-session",
+ "semver",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "winit",

@@ -3,14 +3,12 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import shutil
 from tempfile import NamedTemporaryFile
 from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "vendor" / "ffmpeg-runtime"
 INFO = json.loads((RUNTIME / "build-info.json").read_text(encoding="utf-8"))
-SOURCE_ENTRY = f"codecs/source/FFmpeg-{INFO['ffmpeg_commit']}-source.tar.gz"
 
 
 def digest(path):
@@ -31,12 +29,10 @@ def copy_dll(source, target, expected, name):
         raise ValueError(f"{name} does not match its pinned size and SHA-256")
 
 
-def add_codecs(output, source, open_dll, source_archive):
+def add_codecs(output, source, open_dll):
     for name, expected in INFO["files"].items():
         with open_dll(source, name) as src, output.open(f"codecs/{name}", "w") as dst:
             copy_dll(src, dst, expected, name)
-    with source_archive(source) as src, output.open(SOURCE_ENTRY, "w") as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
 def package(args):
@@ -57,13 +53,11 @@ def package(args):
                 add_codecs(
                     output, seed,
                     lambda archive, name: archive.open(f"codecs/{name}"),
-                    lambda archive: archive.open(SOURCE_ENTRY),
                 )
         else:
             add_codecs(
                 output, args.codec_dir,
                 lambda folder, name: (folder / name).open("rb"),
-                lambda _: args.ffmpeg_source.open("rb"),
             )
     with ZipFile(args.temp) as output:
         if bad := output.testzip():
@@ -77,10 +71,7 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--codec-dir", type=Path)
     source.add_argument("--seed-zip", type=Path)
-    parser.add_argument("--ffmpeg-source", type=Path)
     args = parser.parse_args()
-    if bool(args.codec_dir) != bool(args.ffmpeg_source):
-        parser.error("--codec-dir and --ffmpeg-source must be supplied together")
     if args.output.exists():
         parser.error("output already exists")
     args.output.parent.mkdir(parents=True, exist_ok=True)
