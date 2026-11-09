@@ -1,4 +1,7 @@
-param([ValidateSet('check','clippy','release')][string]$Action='release')
+param(
+    [ValidateSet('check','clippy','release')][string]$Action='release',
+    [string]$SigningKey
+)
 $ErrorActionPreference='Stop'
 
 $taskRoot = $PSScriptRoot
@@ -89,9 +92,14 @@ try {
   try { $source.CopyTo($dest) } finally { $source.Dispose(); $dest.Dispose() }
  } finally { $zip.Dispose(); $stream.Dispose() }
  Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-P','16','-f','4',$unsigned,$aligned)
- $key=Join-Path $artifacts 'test-signing.p12'
- if (!(Test-Path $key)) {
-  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\keytool.exe') @('-genkeypair','-keystore',$key,'-storetype','PKCS12','-storepass','p2pshare-test','-alias','p2pshare-test','-keyalg','RSA','-keysize','2048','-validity','3650','-dname','CN=P2PShare Local Test')
+ if ($SigningKey) {
+  if (!(Test-Path -LiteralPath $SigningKey -PathType Leaf)) { throw 'Android signing keystore was not found.' }
+  $key = (Get-Item -LiteralPath $SigningKey).FullName
+ } else {
+  $key=Join-Path $artifacts 'test-signing.p12'
+  if (!(Test-Path $key)) {
+   Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\keytool.exe') @('-genkeypair','-keystore',$key,'-storetype','PKCS12','-storepass','p2pshare-test','-alias','p2pshare-test','-keyalg','RSA','-keysize','2048','-validity','3650','-dname','CN=P2PShare Local Test')
+  }
  }
  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') @('-jar',(Join-Path $buildTools 'lib\apksigner.jar'),'sign','--v4-signing-enabled','false','--ks',$key,'--ks-pass','pass:p2pshare-test','--ks-key-alias','p2pshare-test','--out',$result,$aligned)
  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') @('-jar',(Join-Path $buildTools 'lib\apksigner.jar'),'verify','--verbose',$result)

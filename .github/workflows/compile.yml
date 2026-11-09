@@ -56,24 +56,45 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:RUSTUP_TOOLCHAIN = 'stable'
           .\tools\setup-android.ps1
-      - name: Build Android ARM64 test APK
+      - name: Build Android ARM64 APK
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          P2PSHARE_ANDROID_SIGNING_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_SIGNING_KEY || '' }}
         run: |
           $env:RUSTUP_TOOLCHAIN = 'stable'
-          .\build-android.ps1 -Action release
+          if ($env:RELEASE_TAG -eq 'true') {
+            if (!$env:P2PSHARE_ANDROID_SIGNING_KEY) { throw 'Missing Android release signing secret.' }
+            $key = Join-Path $env:RUNNER_TEMP 'p2pshare-android-release.p12'
+            try {
+              [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:P2PSHARE_ANDROID_SIGNING_KEY))
+              Remove-Item Env:P2PSHARE_ANDROID_SIGNING_KEY
+              .\build-android.ps1 -Action release -SigningKey $key
+              $apk = 'releases/android/P2PShare-android-arm64.apk'
+              $signer = '.build/android-sdk/build-tools/36.0.0/lib/apksigner.jar'
+              $verify = & java -jar $signer verify --print-certs $apk
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              if (-not ($verify -match 'certificate SHA-256 digest: a044729b4e041b4821edcedfb49a155631e3b5b7884c88410725383cfe19d2f2$')) {
+                throw 'APK does not use the pinned release certificate.'
+              }
+            } finally {
+              if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Force }
+            }
+          } else {
+            .\build-android.ps1 -Action release
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: android-arm64-test
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && 'android-arm64' || 'android-arm64-test' }}
           path: releases/android/P2PShare-android-arm64.apk
           if-no-files-found: error
 
-  publish-windows:
+  publish-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: windows
+    needs: [windows, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
@@ -81,7 +102,22 @@ jobs:
         with:
           name: windows-x64
           path: release-out
-      - name: Sign and publish the Windows update
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: android-arm64
+          path: release-out
+      - name: Assemble the portable Windows ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          seed_tag="$(python3 -c 'import json; print(json.load(open("vendor/ffmpeg-runtime/codec-seed.json"))["tag"])')"
+          gh release download "$seed_tag" --pattern P2PShare-Windows-x64.zip --dir release-out/codec-seed
+          python3 tools/package-windows-release.py --exe release-out/P2PShare.exe \
+            --seed-zip release-out/codec-seed/P2PShare-Windows-x64.zip \
+            --output release-out/P2PShare-Windows-x64.zip
+      - name: Sign and publish the EXE, APK, and portable ZIP
         env:
           GH_TOKEN: ${{ github.token }}
           P2PSHARE_WINDOWS_SIGNING_KEY: ${{ secrets.P2PSHARE_WINDOWS_SIGNING_KEY }}
@@ -113,4 +149,5 @@ jobs:
           printf 'P2PShare Windows x64 update v1\n%s\n%s\n%s\n' "$version" "$hash" "$size" > release-out/signing-message
           openssl pkeyutl -sign -rawin -inkey "$key" -in release-out/signing-message -out "$exe.sig"
           [[ "$(stat -c '%s' "$exe.sig")" == "64" ]]
-          gh release create "$TAG" "$exe" "$exe.sig" --verify-tag --title "P2PShare $TAG" --generate-notes --latest
+          gh release create "$TAG" "$exe" "$exe.sig" release-out/P2PShare-android-arm64.apk \
+            release-out/P2PShare-Windows-x64.zip --verify-tag --title "P2PShare $TAG" --generate-notes --latest
