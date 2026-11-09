@@ -1,0 +1,39 @@
+[package]
+name = "p2pshare-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+p2pshare-rtc.workspace = true
+if-addrs = "0.15"
+socket2 = "0.6"
+p2pshare-media.workspace = true
+tracing.workspace = true
+rand.workspace = true
+base64.workspace = true
+sha2 = "0.10"
+ed25519-dalek = "2"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-websockets = { version = "0.13", features = ["client", "getrandom", "ring", "rustls-webpki-roots"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+openh264 = '0.9'
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-websockets = { version = "0.13", features = ["server", "sha1_smol"] }
+
+[dependencies.toml]
+version = "0.9"
+
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+p2pshare-control-iroh.workspace = true
+p2pshare-discovery.workspace = true

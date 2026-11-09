@@ -1,0 +1,10 @@
+# Display name sent to other room members (1..32 characters).
+username = ""
+
+# WebSocket signaling server. Use the same URL on every device.
+# Use wss:// for public servers; ws:// is permitted only on loopback for tests.
+signaling_url = ""
+
+# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.
+# Names are case-insensitive and repeated spaces are collapsed.
+room_name = ""

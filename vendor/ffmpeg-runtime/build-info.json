@@ -1,0 +1,24 @@
+{
+  "build": "BtbN GPL shared N-126889-gb139ba11d8-20260926",
+  "ffmpeg_commit": "b139ba11d8",
+  "upstream_builds": "https://github.com/BtbN/FFmpeg-Builds",
+  "source": "https://github.com/FFmpeg/FFmpeg/tree/b139ba11d8",
+  "files": {
+    "avcodec-63.dll": {
+      "bytes": 119277056,
+      "sha256": "53deacebce0c5ecdc2ca01b014f082c754f4f42b3d66137e3044d9fee78f88fb"
+    },
+    "avutil-61.dll": {
+      "bytes": 3034112,
+      "sha256": "36353146d672daa5d5f226b15bdd127ccfd8bfeba4f444e9fd5b576290f563a2"
+    },
+    "swresample-7.dll": {
+      "bytes": 739840,
+      "sha256": "9eb611eae1fa87afb4b7a637cbdf73f7d203fcdd48b2f602bba6ee37bf729122"
+    },
+    "swscale-10.dll": {
+      "bytes": 2371072,
+      "sha256": "db4458c2799a323ae03424e80403d5ed0fa58ed62a6319fa11b5e62317b2a403"
+    }
+  }
+}

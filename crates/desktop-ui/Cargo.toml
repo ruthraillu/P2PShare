@@ -1,0 +1,29 @@
+[package]
+name = "p2pshare-desktop-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+p2pshare-desktop-design = { path = "../desktop-design" }
+p2pshare-media.workspace = true
+p2pshare-room-ui.workspace = true
+tracing.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+[target.'cfg(windows)'.dependencies]
+p2pshare-platform-windows.workspace = true
+windows = {workspace=true,features=["Win32_UI_Controls_Dialogs","Win32_System_Diagnostics_ToolHelp","Win32_System_Performance"]}
+egui.workspace = true
+egui-directx11 = "0.13"
+egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
+
+anyhow.workspace = true
+serde.workspace = true
+toml = "0.9"
+p2pshare-session.workspace = true
+p2pshare-codecs-windows.workspace = true
+
+
+windows-core = "0.62"

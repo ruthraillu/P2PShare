@@ -1,0 +1,23 @@
+[package]
+name = "p2pshare-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[lib]
+name = "p2pshare_android"
+crate-type = ["cdylib", "rlib"]
+[target.'cfg(target_os = "android")'.dependencies]
+p2pshare-room-ui.workspace = true
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "android-native-activity"] }
+android_logger = "0.15"
+log = "0.4"
+
+p2pshare-session.workspace = true
+p2pshare-media.workspace = true
+jni = '0.21'
+glow = '0.17'
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

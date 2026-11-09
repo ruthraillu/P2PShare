@@ -1,0 +1,8 @@
+[package]
+name = "p2pshare-room-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+egui.workspace = true
+p2pshare-media.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "p2pshare-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+p2pshare-protocol.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+opus = "0.4"
+
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+sha2 = "0.10"

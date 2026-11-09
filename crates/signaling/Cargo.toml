@@ -1,0 +1,6 @@
+[package]
+name = "p2pshare-signaling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+

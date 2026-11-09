@@ -1,0 +1,64 @@
+name: Compile P2PShare
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  CMAKE_BUILD_PARALLEL_LEVEL: "1"
+  RAYON_NUM_THREADS: "1"
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Compile Windows x64
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable build --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop -j 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path ci-out | Out-Null
+          Copy-Item '.build/target/x86_64-pc-windows-msvc/release/P2PShare.exe' 'ci-out/P2PShare.exe'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x64
+          path: ci-out/P2PShare.exe
+          if-no-files-found: error
+
+  android:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Android ARM64 build tools
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RUSTUP_TOOLCHAIN = 'stable'
+          .\tools\setup-android.ps1
+      - name: Build Android ARM64 test APK
+        shell: pwsh
+        run: |
+          $env:RUSTUP_TOOLCHAIN = 'stable'
+          .\build-android.ps1 -Action release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-arm64-test
+          path: releases/android/P2PShare-android-arm64.apk
+          if-no-files-found: error

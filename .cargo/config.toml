@@ -1,0 +1,18 @@
+[build]
+jobs = 1
+target = "x86_64-pc-windows-msvc"
+target-dir = ".build/target"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+debug = 0
+lto = false
+codegen-units = 1
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "tools/opus-msvc.cmake", relative = true }

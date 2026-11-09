@@ -1,0 +1,14 @@
+[package]
+name = "p2pshare-rtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
+serde.workspace = true
+serde_json.workspace = true
+
+tracing.workspace = true
+
+p2pshare-media.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "p2pshare-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+p2pshare-media.workspace = true
+tracing.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

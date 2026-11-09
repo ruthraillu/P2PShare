@@ -1,0 +1,8 @@
+/.build/
+/P2PAPP/
+/releases/
+/ci-out/
+/target/
+/config.toml
+/data/
+*.log

@@ -1,0 +1,1 @@
+package android.media; public class MediaFormat { public static final String KEY_MAX_INPUT_SIZE="size",KEY_LOW_LATENCY="latency"; public static MediaFormat createVideoFormat(String type,int w,int h){return new MediaFormat();} public final java.util.HashMap<String,Integer> values=new java.util.HashMap<>(); public void setInteger(String key,int value){values.put(key,value);} }
