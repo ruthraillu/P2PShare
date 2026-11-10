@@ -26,6 +26,7 @@ ed25519-dalek = "2.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 semver = "1"
 sha2 = "0.10"
+zip = { version = "=9.4.0", default-features = false, features = ["deflate-flate2"] }
 toml = "0.9"
 p2pshare-session.workspace = true
 p2pshare-codecs-windows.workspace = true

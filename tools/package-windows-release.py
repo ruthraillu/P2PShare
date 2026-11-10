@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -59,6 +60,31 @@ def package(args):
                 output, args.codec_dir,
                 lambda folder, name: (folder / name).open("rb"),
             )
+        assets = ROOT / "assets/windows-update"
+        for path in sorted(assets.rglob("*")):
+            if path.is_symlink():
+                raise ValueError(f"Linked update asset: {path}")
+            if path.is_file():
+                parts = path.relative_to(assets).parts
+                if any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", part)
+                       or part.endswith(".") or re.fullmatch(r"(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])", part.split(".")[0], re.I)
+                       for part in parts):
+                    raise ValueError(f"Invalid update asset path: {path}")
+                output.write(path, "data/assets/" + "/".join(parts))
+    # Reopen to read the on-disk names, which ZIP normalizes to forward slashes.
+    with ZipFile(args.temp, "a", compression=ZIP_DEFLATED, compresslevel=5) as output:
+        names = output.namelist()
+        if len(names) > 256 or len({name.lower() for name in names}) != len(names):
+            raise ValueError("Too many update files or conflicting filenames")
+        if any(len(name) > 180 for name in names) or sum(entry.file_size for entry in output.infolist()) > 512 * 1024 * 1024 - 256 * 1024:
+            raise ValueError("Update file paths or expanded archive exceeded limits")
+        inventory = {}
+        for name in names:
+            with output.open(name) as file:
+                inventory[name] = hashlib.file_digest(file, "sha256").hexdigest()
+        output.writestr("data/updates/managed.json", json.dumps(inventory, sort_keys=True))
+    if args.temp.stat().st_size > 256 * 1024 * 1024:
+        raise ValueError("Compressed update exceeds the updater's size limit")
     with ZipFile(args.temp) as output:
         if bad := output.testzip():
             raise ValueError(f"Portable ZIP checksum failed for {bad}")

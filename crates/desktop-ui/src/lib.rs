@@ -3,7 +3,7 @@ mod firewall;
 #[cfg(windows)]
 mod updater;
 #[cfg(windows)]
-pub use updater::command_mode as update_command_mode;
+pub use updater::{command_mode as update_command_mode, recover_pending_update};
 #[cfg(windows)]
 pub use firewall::command_mode as firewall_command_mode;
 #[cfg(windows)]

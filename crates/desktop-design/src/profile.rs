@@ -300,14 +300,71 @@ mod tests {
 }
 
 impl App {
+    pub fn reset_nickname_draft(&mut self, peer: u64) {
+        if let Some((id, draft)) = &mut self.nickname_draft
+            && *id == peer
+        {
+            *draft = self.profile_nicknames.get(&peer).cloned().unwrap_or_default();
+        }
+    }
+
+    fn draw_nickname_editor(&mut self, ui: &mut egui::Ui, id: u64) {
+        use p2pshare_media::tr;
+        let p = self.palette();
+        let saved = self.profile_nicknames.get(&id);
+        let Some((_, draft)) = &mut self.nickname_draft else { return };
+        ui.add_space(6.);
+        ui.label(egui::RichText::new(tr!("Nickname")).strong().color(p.text));
+        let input = ui.add_sized(
+            [ui.available_width(), 36.],
+            egui::TextEdit::singleline(draft)
+                .id_salt(("profile-nickname", id))
+                .char_limit(32)
+                .hint_text(tr!("Add a nickname"))
+                .vertical_align(egui::Align::Center),
+        );
+        self.hits.insert("profile-nickname-input".into(), input.rect);
+        ui.label(egui::RichText::new(tr!("Only you can see this nickname.")).size(12.).color(p.muted));
+        let nickname = draft.trim();
+        let can_save = !nickname.is_empty()
+            && !nickname.chars().any(char::is_control)
+            && saved.is_none_or(|value| value != nickname);
+        ui.horizontal(|ui| {
+            if saved.is_some() {
+                let remove = ui.add(egui::Button::new(tr!("Remove nickname")).frame(false));
+                self.hits.insert("profile-nickname-remove".into(), remove.rect);
+                if remove.clicked() {
+                    self.intents.push(Intent::SetNickname { peer: id, nickname: None });
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = egui::Button::new(egui::RichText::new(tr!("Save")).color(p.accent_text))
+                    .fill(p.accent)
+                    .min_size(vec2(96., 30.));
+                let save = ui.add_enabled(can_save, button);
+                self.hits.insert("profile-nickname-save".into(), save.rect);
+                if save.clicked() {
+                    self.intents.push(Intent::SetNickname { peer: id, nickname: Some(nickname.into()) });
+                }
+            });
+        });
+        if self.nickname_save_failed {
+            ui.label(egui::RichText::new(tr!("Could not save nickname.")).color(p.red));
+        }
+        ui.separator();
+    }
+
     pub fn draw_profile_viewer(&mut self, ctx: &egui::Context) {
         let Some(id) = self.profile_view else {
             self.profile_history_textures.clear();
             self.profile_history_key = None;
+            self.nickname_draft = None;
+            self.nickname_save_failed = false;
             return;
         };
         let Some(member) = self.members.iter().find(|m| m.id == id) else {
             self.profile_view = None;
+            self.nickname_draft = None;
             return;
         };
         let name = if id == 0 {
@@ -316,6 +373,10 @@ impl App {
             member.name.clone()
         };
         let sharing = member.scene.is_some();
+        if self.nickname_draft.as_ref().is_none_or(|(peer, _)| *peer != id) {
+            self.nickname_draft = Some((id, self.profile_nicknames.get(&id).cloned().unwrap_or_default()));
+            self.nickname_save_failed = false;
+        }
         let p = self.palette();
         let just_opened=self.profile_history_key != Some(id);
         if just_opened {
@@ -355,6 +416,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("×").clicked() {
                             self.profile_view = None;
+                            self.nickname_draft = None;
                         }
                     });
                 });
@@ -403,6 +465,9 @@ impl App {
                 egui::ScrollArea::vertical()
                     .max_height(height).min_scrolled_height(height).auto_shrink([false,false])
                     .show(ui, |ui| {
+                        if id != 0 {
+                            self.draw_nickname_editor(ui, id);
+                        }
                         if !names.is_empty() {
                             ui.add_space(10.);
                             ui.horizontal(|ui| {
@@ -478,6 +543,7 @@ impl App {
             });
         if !just_opened && modal.should_close() {
             self.profile_view = None;
+            self.nickname_draft = None;
             self.profile_enlarged = None;
         }
         if let Some(texture) = self.profile_enlarged {
@@ -497,6 +563,53 @@ impl App {
 #[cfg(test)]
 mod viewer_tests {
     use super::*;
+    #[test]
+    fn nickname_editor_emits_save_and_remove_for_the_clicked_peer() {
+        let ctx = egui::Context::default();
+        let mut app = App::live(Default::default(), "grupo".into(), false);
+        app.joined = true;
+        app.members.push(crate::app::Member {
+            id: 42,
+            name: "Rafael_M".into(),
+            ..Default::default()
+        });
+        let render = |a: &mut App, events| ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect(0., 0., 950., 680.)),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ui| a.ui(ui),
+        );
+        let click = |app: &mut App, key: &str| {
+            let pos = app.hits[key].center();
+            for pressed in [true, false] {
+                render(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                }]);
+            }
+        };
+        for _ in 0..3 { render(&mut app, vec![]); }
+        click(&mut app, "profile-user-42");
+        assert_eq!(app.profile_view, Some(42));
+        app.nickname_draft = Some((42, " Rafa ".into()));
+        for _ in 0..3 { render(&mut app, vec![]); }
+        click(&mut app, "profile-nickname-save");
+        assert!(matches!(app.intents.pop(), Some(Intent::SetNickname { peer: 42, nickname: Some(n) }) if n == "Rafa"));
+        app.profile_nicknames.insert(42, "Rafa".into());
+        app.reset_nickname_draft(42);
+        let output = render(&mut app, vec![]);
+        assert!(output.shapes.iter().any(|s| matches!(
+            &s.shape, egui::Shape::Text(t) if t.galley.text() == "Rafael_M (Rafa)"
+        )));
+        click(&mut app, "profile-nickname-remove");
+        assert!(matches!(app.intents.pop(), Some(Intent::SetNickname { peer: 42, nickname: None })));
+        app.profile_view = Some(0);
+        render(&mut app, vec![]);
+        assert!(!app.hits.contains_key("profile-nickname-input"));
+    }
+
     #[test]
     fn sidebar_opens_profile_and_long_names_expand() {
         let ctx = egui::Context::default();

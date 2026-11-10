@@ -14,6 +14,8 @@ fn main() -> std::process::ExitCode {
     }
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let home = p2pshare_media::portable::data_dir()?;
+        #[cfg(windows)]
+        p2pshare_desktop_ui::recover_pending_update(&home)?;
         if std::env::args().any(|a|a=="--migrate-data-only"){return Ok(());}
         // Read before touching either log, so disabled mode does not create,
         // rotate, truncate or append to existing log files.

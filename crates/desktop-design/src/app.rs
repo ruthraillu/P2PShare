@@ -122,6 +122,7 @@ pub enum Intent {
     Save(Box<Config>),
     ChooseAvatar,
     SaveAvatar(Option<Vec<u8>>),
+    SetNickname { peer: u64, nickname: Option<String> },
     Join(String),
     Leave,
     Firewall,
@@ -138,6 +139,9 @@ pub struct App {
     pub update_open: bool,
     pub avatars:HashMap<u64,egui::TextureId>,
     pub profile_view:Option<u64>,
+    pub profile_nicknames: HashMap<u64, String>,
+    pub(crate) nickname_draft: Option<(u64, String)>,
+    pub nickname_save_failed: bool,
     pub profile_names:HashMap<u64,Vec<String>>,
     pub profile_images:HashMap<u64,Vec<std::sync::Arc<[u8]>>>,
     pub profile_history_textures:Vec<egui::TextureHandle>,
@@ -230,6 +234,9 @@ impl App {
             signaling_setup: None,
             update: None,
             update_open: false,
+            profile_nicknames: Default::default(),
+            nickname_draft: None,
+            nickname_save_failed: false,
             profile_view:None,profile_names:Default::default(),profile_images:Default::default(),profile_history_textures:Vec::new(),profile_history_key:None,profile_show_names:false,profile_enlarged:None,
             avatars:Default::default(),avatar_data:Default::default(),crop:None,pending_avatar:None,profile_preview:None,
             live: false,
@@ -638,16 +645,43 @@ impl App {
                             }
                             let profile_hit=rect(x+12.,yy,r.width()-24.,44.);
                             self.hits.insert(format!("profile-user-{}",m.id),profile_hit);
-                            if ui.interact(profile_hit,ui.id().with(("profile-user",m.id)),egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked(){self.profile_view=Some(m.id);self.profile_show_names=false;}
+                            let profile = ui.interact(profile_hit, ui.id().with(("profile-user", m.id)), egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if profile.clicked() {
+                                self.profile_view = Some(m.id);
+                                self.profile_show_names = false;
+                            }
                             ui.painter().galley(at, glyph, color);
                             if let Some(texture)=self.avatars.get(&m.id){crate::profile::circle(ui.painter(),center,20.,*texture,Rect::from_min_max(pos2(0.,0.),pos2(1.,1.)));}
-                            label(
-                                ui,
-                                rect(x + 65., yy, r.width() - 77., 22.),
-                                &format!("{name}{}", if i == 0 { p2pshare_media::tr!(" (you)") } else { "" }),
-                                14.,
-                                p.text,
-                            );
+                            let name_area = rect(x + 65., yy, r.width() - 77., 22.);
+                            if let Some(nickname) = self.profile_nicknames.get(&m.id) {
+                                let mut job = egui::text::LayoutJob::default();
+                                job.wrap.max_width = name_area.width();
+                                job.wrap.max_rows = 1;
+                                job.append(name, 0., egui::TextFormat::simple(FontId::proportional(14.), p.text));
+                                job.append(
+                                    &format!(" ({nickname})"),
+                                    0.,
+                                    egui::TextFormat::simple(
+                                        FontId::proportional(14.),
+                                        p.accent.lerp_to_gamma(p.text, 0.40),
+                                    ),
+                                );
+                                let galley = ui.painter().layout_job(job);
+                                if galley.elided {
+                                    profile.on_hover_text(format!("{name} ({nickname})"));
+                                }
+                                let at = name_area.left_center() - vec2(0., galley.size().y / 2.);
+                                ui.painter_at(name_area).galley(at, galley, p.text);
+                            } else {
+                                label(
+                                    ui,
+                                    name_area,
+                                    &format!("{name}{}", if i == 0 { p2pshare_media::tr!(" (you)") } else { "" }),
+                                    14.,
+                                    p.text,
+                                );
+                            }
                             text(
                                 ui,
                                 pos2(x + 65., yy + 23.),

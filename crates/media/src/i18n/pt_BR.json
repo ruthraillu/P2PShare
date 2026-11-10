@@ -284,5 +284,10 @@
   "Download update": "Baixar atualização",
   "Restart and install": "Reiniciar e instalar",
   "Later": "Mais tarde",
+  "Nickname": "Apelido",
+  "Add a nickname": "Adicionar apelido",
+  "Only you can see this nickname.": "Só você vê esse apelido.",
+  "Remove nickname": "Remover apelido",
+  "Could not save nickname.": "Não foi possível salvar o apelido.",
   "Room is full. Waiting for a spot…": "A sala está cheia. Aguardando uma vaga…"
 }

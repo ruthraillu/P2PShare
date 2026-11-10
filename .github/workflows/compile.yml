@@ -32,7 +32,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop-design --lib -j 1 updates::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo +stable test --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop-ui --lib -j 1 updater::tests
+          cargo +stable test --locked --release --target x86_64-pc-windows-msvc -p p2pshare-desktop-ui --lib -j 1 updater::
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Path ci-out | Out-Null
           Copy-Item '.build/target/x86_64-pc-windows-msvc/release/P2PShare.exe' 'ci-out/P2PShare.exe'
@@ -118,7 +118,7 @@ jobs:
           python3 tools/package-windows-release.py --exe release-out/P2PShare.exe \
             --seed-zip release-out/codec-seed/P2PShare-Windows-x64.zip \
             --output release-out/P2PShare-Windows-x64.zip
-      - name: Sign and publish the EXE, APK, and portable ZIP
+      - name: Sign and publish the Windows and Android release
         env:
           GH_TOKEN: ${{ github.token }}
           P2PSHARE_WINDOWS_SIGNING_KEY: ${{ secrets.P2PSHARE_WINDOWS_SIGNING_KEY }}
@@ -144,11 +144,21 @@ jobs:
           trap 'rm -f "$key"' EXIT
           printf '%s' "$P2PSHARE_WINDOWS_SIGNING_KEY" | base64 --decode > "$key"
           unset P2PSHARE_WINDOWS_SIGNING_KEY
-          exe=release-out/P2PShare.exe
-          read -r hash _ < <(sha256sum "$exe")
-          size="$(stat -c '%s' "$exe")"
-          printf 'P2PShare Windows x64 update v1\n%s\n%s\n%s\n' "$version" "$hash" "$size" > release-out/signing-message
-          openssl pkeyutl -sign -rawin -inkey "$key" -in release-out/signing-message -out "$exe.sig"
-          [[ "$(stat -c '%s' "$exe.sig")" == "64" ]]
-          gh release create "$TAG" "$exe" "$exe.sig" release-out/P2PShare-android-arm64.apk \
-            release-out/P2PShare-Windows-x64.zip --verify-tag --title "P2PShare $TAG" --generate-notes --latest
+          sign() {
+            local asset="$1" domain="$2" hash size
+            read -r hash _ < <(sha256sum "$asset")
+            size="$(stat -c '%s' "$asset")"
+            printf '%s\n%s\n%s\n%s\n' "$domain" "$version" "$hash" "$size" > release-out/signing-message
+            openssl pkeyutl -sign -rawin -inkey "$key" -in release-out/signing-message -out "$asset.sig"
+            [[ "$(stat -c '%s' "$asset.sig")" == "64" ]]
+          }
+          zip=release-out/P2PShare-Windows-x64.zip
+          sign "$zip" 'P2PShare Windows x64 ZIP update v2'
+          set -- "$zip" "$zip.sig" release-out/P2PShare-android-arm64.apk
+          # Bridge for versions that only understand EXE updates.
+          if [[ "$TAG" == v0.13.1 ]]; then
+            exe=release-out/P2PShare.exe
+            sign "$exe" 'P2PShare Windows x64 update v1'
+            set -- "$@" "$exe" "$exe.sig"
+          fi
+          gh release create "$TAG" "$@" --verify-tag --title "P2PShare $TAG" --generate-notes --latest

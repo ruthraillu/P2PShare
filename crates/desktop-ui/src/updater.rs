@@ -1,5 +1,7 @@
-//! Windows executable updates. GitHub is queried for metadata, and payloads
+//! Signed Windows ZIP updates. GitHub is queried for metadata, and payloads
 //! are fetched only in response to an explicit download request.
+#[path = "update_bundle.rs"]
+mod bundle;
 use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
 use p2pshare_desktop_design::updates::{Notice, Phase};
@@ -19,9 +21,9 @@ use std::{
 
 const API: &str = "https://api.github.com/repos/ruthraillu/P2PShare/releases/latest";
 const RELEASES: &str = "https://github.com/ruthraillu/P2PShare/releases/download";
-const EXE: &str = "P2PShare.exe";
-const SIG: &str = "P2PShare.exe.sig";
-const MAX_EXE: u64 = 128 * 1024 * 1024;
+const ZIP: &str = "P2PShare-Windows-x64.zip";
+const SIG: &str = "P2PShare-Windows-x64.zip.sig";
+const MAX_ZIP: u64 = 256 * 1024 * 1024;
 const MAX_METADATA: u64 = 256 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const PUBLIC_KEY: &str = "bb9ccfd7a732935c5a237a1e261d79e5b236b8d09ab9f740e0576985fcf75833";
@@ -40,7 +42,7 @@ impl Payload {
 
     fn validate(&self) -> Result<()> {
         self.version()?;
-        ensure!((1..=MAX_EXE).contains(&self.size), "Unexpected update size");
+        ensure!((1..=MAX_ZIP).contains(&self.size), "Unexpected update size");
         decode_hex::<32>(&self.sha256)?;
         ensure!(
             self.sha256 == self.sha256.to_ascii_lowercase(),
@@ -51,7 +53,7 @@ impl Payload {
 
     fn signed_message(&self) -> String {
         format!(
-            "P2PShare Windows x64 update v1\n{}\n{}\n{}\n",
+            "P2PShare Windows x64 ZIP update v2\n{}\n{}\n{}\n",
             self.version, self.sha256, self.size
         )
     }
@@ -153,20 +155,20 @@ impl GithubRelease {
         if &stable_version(tag)? <= current {
             return Ok(None);
         }
-        let Some(exe) = self.assets.iter().find(|a| a.name == EXE) else {
+        let Some(zip) = self.assets.iter().find(|a| a.name == ZIP) else {
             return Ok(None);
         };
         if !self.assets.iter().any(|a| a.name == SIG && a.size == 64) {
             return Ok(None);
         }
-        let sha256 = exe
+        let sha256 = zip
             .digest
             .as_deref()
             .and_then(|d| d.strip_prefix("sha256:"))
-            .context("Release is missing its executable digest")?;
+            .context("Release is missing its ZIP digest")?;
         let payload = Payload {
             version: tag.into(),
-            size: exe.size,
+            size: zip.size,
             sha256: sha256.into(),
         };
         payload.validate()?;
@@ -254,16 +256,13 @@ fn clean_stage(path: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return,
     }
-    for name in [
-        "payload.exe",
-        "payload.json",
-        "payload.sig",
-        "backup.exe",
-        "installed",
-    ] {
-        let _ = fs::remove_file(path.join(name));
-    }
-    let _ = fs::remove_dir(path);
+    let _ = fs::remove_dir_all(path);
+}
+
+fn stage_name(name: &str) -> bool {
+    name.strip_prefix("stage-")
+        .and_then(|value| value.split_once('-'))
+        .is_some_and(|(pid, stamp)| pid.parse::<u32>().is_ok() && stamp.parse::<u128>().is_ok())
 }
 
 fn update_root(data: &Path) -> Result<PathBuf> {
@@ -300,8 +299,8 @@ fn cleanup_finished(data: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with("stage-")
-            && path.canonicalize().ok().as_deref().and_then(Path::parent) == Some(updates.as_path())
+        if stage_name(&entry.file_name().to_string_lossy())
+            && path.canonicalize().ok().as_deref() == Some(path.as_path())
             && path.join("installed").is_file()
         {
             clean_stage(&path);
@@ -321,11 +320,11 @@ async fn download(payload: Payload, data: &Path, tx: &Sender<Event>) -> Result<S
     let signature = bounded_body(response, 64).await?;
     payload.verify_signature(&signature, &public_key()?)?;
     let response = client
-        .get(format!("{url}/{EXE}"))
+        .get(format!("{url}/{ZIP}"))
         .send()
         .await?
         .error_for_status()?;
-    let path = stage.0.join("payload.exe");
+    let path = stage.0.join("payload.zip");
     let mut file = File::options().write(true).create_new(true).open(&path)?;
     write_download(response, &mut file, payload.size, |percent| {
         let _ = tx.send(Event::Progress(percent));
@@ -484,21 +483,32 @@ fn wait_for_exit(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn replace_and_restart(
-    stage: &Path,
-    target: &Path,
-    restart: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
-    let backup = stage.join("backup.exe");
-    fs::copy(target, &backup).context("Could not back up the current executable")?;
-    fs::rename(stage.join("payload.exe"), target)
-        .context("Could not replace P2PShare. Close other instances and try again.")?;
-    if let Err(error) = restart(target) {
-        fs::rename(&backup, target)
-            .context("Could not restore the old executable; backup is in data/updates")?;
-        return Err(error.context("Update could not start. The previous executable was restored."));
+fn install_lock(updates: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let path = updates.join("install.lock");
+    for _ in 0..50 {
+        match File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => return Ok(file),
+            Err(error) if error.raw_os_error() == Some(32) => {
+                thread::sleep(Duration::from_millis(100))
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(())
+    bail!("Another update may be installing")
+}
+
+pub fn recover_pending_update(data: &Path) -> Result<()> {
+    let home = data
+        .parent()
+        .context("Installation directory unavailable")?;
+    bundle::recover(home, data)
 }
 
 fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
@@ -514,7 +524,8 @@ fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
             && data.ends_with("data")
             && stage
                 .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("stage-"))
+                .and_then(|n| n.to_str())
+                .is_some_and(stage_name)
             && exe.ends_with("installer.exe"),
         "Unexpected installer path"
     );
@@ -527,7 +538,7 @@ fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
         "Invalid executable name"
     );
     let target = home.join(name);
-    let payload_path = stage.join("payload.exe");
+    let payload_path = stage.join("payload.zip");
     for path in [
         &target,
         &payload_path,
@@ -553,27 +564,19 @@ fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
         .read_to_end(&mut signature)?;
     payload.verify_signature(&signature, &public_key()?)?;
     wait_for_exit(pid)?;
-    use std::os::windows::fs::OpenOptionsExt;
-    let _lock = File::options()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(updates.join("install.lock"))
-        .context("Another update may be installing")?;
+    let _lock = install_lock(updates)?;
     payload.verify_file(&payload_path)?;
     ensure!(
         file_digest(&target)? == file_digest(&exe)?,
         "The running installation changed before updating"
     );
-    replace_and_restart(stage, &target, |path| {
+    let filename = filename
+        .to_str()
+        .context("Executable name is not Unicode")?;
+    bundle::install(home, data, stage, filename, |path| {
         Command::new(path).current_dir(home).spawn()?;
         Ok(())
-    })?;
-    // The running helper cannot delete itself on Windows. The next app run clears it.
-    // Keep the backup until the new app reaches its startup update poll.
-    let _ = fs::write(stage.join("installed"), []);
-    Ok(())
+    })
 }
 
 pub fn command_mode() -> Option<ExitCode> {
@@ -624,7 +627,7 @@ mod tests {
             body: None,
             assets: vec![
                 GithubAsset {
-                    name: EXE.into(),
+                    name: ZIP.into(),
                     size: 3,
                     digest: Some(format!("sha256:{}", sample().sha256)),
                 },
@@ -691,26 +694,14 @@ mod tests {
     }
 
     #[test]
-    fn replaces_only_the_exe_and_rolls_back_if_restart_fails() {
+    fn corrupted_zip_payload_is_rejected() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.build/update-tests");
         fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let stage = stage(&root).unwrap();
-        let target = stage.0.join("app.exe");
-        let config = stage.0.join("config.toml");
-        fs::write(&target, b"old").unwrap();
-        fs::write(&config, b"personal").unwrap();
-        fs::write(stage.0.join("payload.exe"), b"bad").unwrap();
-        assert!(sample().verify_file(&stage.0.join("payload.exe")).is_err());
-        fs::write(stage.0.join("payload.exe"), b"new").unwrap();
-        sample().verify_file(&stage.0.join("payload.exe")).unwrap();
-        assert!(replace_and_restart(&stage.0, &target, |_| bail!("test")).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"old");
-        fs::write(stage.0.join("payload.exe"), b"new").unwrap();
-        replace_and_restart(&stage.0, &target, |_| Ok(())).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new");
-        assert_eq!(fs::read(&config).unwrap(), b"personal");
-        fs::remove_file(&target).unwrap();
-        fs::remove_file(&config).unwrap();
+        let stage = stage(&root.canonicalize().unwrap()).unwrap();
+        let path = stage.0.join("payload.zip");
+        fs::write(&path, b"bad").unwrap();
+        assert!(sample().verify_file(&path).is_err());
+        fs::write(&path, b"new").unwrap();
+        sample().verify_file(&path).unwrap();
     }
 }

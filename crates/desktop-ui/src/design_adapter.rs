@@ -337,6 +337,7 @@ impl View {
                     Intent::Save(config) => self.save_design(&config)?,
                     Intent::ChooseAvatar=>self.choose_avatar()?,
                     Intent::SaveAvatar(bytes)=>self.save_avatar(bytes)?,
+                    Intent::SetNickname { peer, nickname } => self.save_nickname(peer, nickname),
                     Intent::Join(room) => {
                         self.app_config.room_name = room.clone();
                         std::fs::write(&self.config_path, self.app_config.document()?)?;

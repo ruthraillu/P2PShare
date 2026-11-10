@@ -75,6 +75,29 @@ impl View {
             .command(p2pshare_session::Command::Avatar(bytes));
         Ok(())
     }
+    pub(super) fn save_nickname(&mut self, peer: u64, nickname: Option<String>) {
+        let result = (|| -> anyhow::Result<()> {
+            let roster = self.session.snapshot();
+            let member = roster.members.iter().find(|member| {
+                member.id != roster.local_id && p2pshare_room_ui::peer_ui_id(&member.id) == peer
+            }).ok_or_else(|| anyhow::anyhow!("Participant left the room"))?;
+            let data = p2pshare_media::portable::data_dir()?;
+            write_nickname(&data, &member.id, nickname.as_deref())?;
+            if let Some(nickname) = nickname {
+                self.design.profile_nicknames.insert(peer, nickname);
+            } else {
+                self.design.profile_nicknames.remove(&peer);
+            }
+            Ok(())
+        })();
+        self.design.nickname_save_failed = result.is_err();
+        if let Err(error) = result {
+            tracing::warn!(%error, "profile_nickname_save_failed");
+        } else {
+            self.design.reset_nickname_draft(peer);
+        }
+    }
+
     pub(super) fn sync_avatars(&mut self) {
         if !self.avatars.initialized {
             self.avatars.initialized = true;
@@ -133,7 +156,19 @@ impl View {
         self.design
             .profile_images
             .retain(|id, _| entries.iter().any(|(_, i, _)| i == id));
+        self.design
+            .profile_nicknames
+            .retain(|id, _| entries.iter().any(|(_, i, _)| i == id));
         for (key, id, bytes) in entries {
+            if id != 0 && !self.avatars.seen.contains_key(&key) {
+                if let Ok(data) = p2pshare_media::portable::data_dir() {
+                    match read_nickname(&data, &key) {
+                        Ok(Some(nickname)) => { self.design.profile_nicknames.insert(id, nickname); }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "profile_nickname_read_failed"),
+                    }
+                }
+            }
             let stable = if id == 0 {
                 state.local_id.clone()
             } else {
@@ -202,10 +237,85 @@ impl View {
     }
 }
 
+fn nickname_path(data: &std::path::Path, peer: &str) -> anyhow::Result<std::path::PathBuf> {
+    anyhow::ensure!(peer.len() == 64 && peer.bytes().all(|c| c.is_ascii_hexdigit()), "Invalid peer identity");
+    Ok(data.join("profile/nicknames").join(format!("{}.txt", peer.to_ascii_lowercase())))
+}
+
+fn validate_nickname(value: &str) -> anyhow::Result<&str> {
+    let value = value.trim();
+    anyhow::ensure!(
+        !value.is_empty() && value.chars().count() <= 32 && !value.chars().any(char::is_control),
+        "Nickname must contain 1 to 32 printable characters"
+    );
+    Ok(value)
+}
+
+fn read_nickname(data: &std::path::Path, peer: &str) -> anyhow::Result<Option<String>> {
+    use std::io::Read;
+    let file = match std::fs::File::open(nickname_path(data, peer)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut text = String::new();
+    file.take(129).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() <= 128, "Nickname file is too large");
+    Ok(Some(validate_nickname(&text)?.to_owned()))
+}
+
+fn write_nickname(data: &std::path::Path, peer: &str, nickname: Option<&str>) -> anyhow::Result<()> {
+    use std::{fs, io::Write, time::{SystemTime, UNIX_EPOCH}};
+    let path = nickname_path(data, peer)?;
+    let Some(nickname) = nickname else {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    };
+    let nickname = validate_nickname(nickname)?;
+    fs::create_dir_all(path.parent().unwrap())?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let pending = path.with_extension(format!("{}-{stamp}.pending", std::process::id()));
+    let mut file = fs::File::options().write(true).create_new(true).open(&pending)?;
+    let result = file.write_all(nickname.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    let result = result.and_then(|()| fs::rename(&pending, path));
+    if result.is_err() {
+        let _ = fs::remove_file(pending);
+    }
+    Ok(result?)
+}
+
 fn avatar_path(config:&std::path::Path,reference:&str)->std::path::PathBuf {
  let home=config.parent().unwrap();let path=home.join(reference);
  let legacy=home.join("data").join(reference);
  if !path.exists()&&!std::path::Path::new(reference).is_absolute()&&legacy.is_file(){legacy}else{path}
+}
+
+#[cfg(test)]
+mod nickname_tests {
+    use super::*;
+
+    #[test]
+    fn nickname_is_stored_by_peer_identity_and_can_be_replaced_or_removed() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.build/nickname-tests")
+            .join(std::process::id().to_string());
+        let peer = "a".repeat(64);
+        let other = "b".repeat(64);
+        assert_eq!(read_nickname(&data, &peer).unwrap(), None);
+        write_nickname(&data, &peer, Some("  Rafa  ")).unwrap();
+        assert_eq!(read_nickname(&data, &peer).unwrap().as_deref(), Some("Rafa"));
+        assert_eq!(read_nickname(&data, &other).unwrap(), None);
+        assert!(write_nickname(&data, &peer, Some("Invalid\nname")).is_err());
+        assert!(write_nickname(&data, "../other", Some("Invalid identity")).is_err());
+        write_nickname(&data, &peer, Some("Rafinha")).unwrap();
+        assert_eq!(read_nickname(&data, &peer).unwrap().as_deref(), Some("Rafinha"));
+        write_nickname(&data, &peer, None).unwrap();
+        assert_eq!(read_nickname(&data, &peer).unwrap(), None);
+    }
 }
 
 #[cfg(test)]mod avatar_location_tests {
