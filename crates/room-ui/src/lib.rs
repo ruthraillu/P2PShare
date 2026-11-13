@@ -14,6 +14,7 @@ mod dialogs;
 mod layout;
 mod members;
 mod model;
+pub use model::{DiagnosticRun, DiagnosticReceipt};
 mod streams;
 mod theme;
 mod video;

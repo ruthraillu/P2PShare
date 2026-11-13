@@ -22,9 +22,21 @@ pub fn set_enabled(value: bool) {
         b.push_str("P2PShare diagnostics: times are milliseconds; RTT=-1 means unavailable; receiver latency excludes sender/network before first packet.\n");
     }
 }
+#[cfg(target_os = "android")]
+static ARCHIVE: OnceLock<Mutex<Option<Box<dyn Write + Send>>>> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub fn set_archive(writer: Option<Box<dyn Write + Send>>) {
+    *ARCHIVE.get_or_init(Default::default).lock().unwrap() = writer;
+}
+
 pub fn append(text: &str) {
     if !enabled() {
         return;
+    }
+    #[cfg(target_os = "android")]
+    if let Some(writer) = ARCHIVE.get_or_init(Default::default).lock().unwrap().as_mut() {
+        let _ = writer.write_all(text.as_bytes());
     }
     let mut b = BUFFER.get_or_init(Default::default).lock().unwrap();
     b.push_str(text);

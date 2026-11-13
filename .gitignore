@@ -1,8 +1,22 @@
+# Generated outputs, private runtime state and local tools
 /.build/
+/.wrangler/
 /P2PAPP/
+/UIPrototype/
 /releases/
-/ci-out/
-/target/
-/config.toml
-/data/
-*.log
+/archive/
+/diagnostics/
+/notes/
+# External research projects; required build dependencies remain in vendor/
+/references/
+# Worker-generated dependencies and local state
+/server/signaling-worker/node_modules/
+/server/signaling-worker/.wrangler/
+/prototypes/desktop-ui/target/
+/tools/android-ui-preview/target/
+
+# Locally prepared distribution folders
+/@@@build-to-share/
+
+# Local diagnostics destination and upload token
+diagnostics-upload.toml

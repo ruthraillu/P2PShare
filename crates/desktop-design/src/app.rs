@@ -126,6 +126,7 @@ pub enum Intent {
     Join(String),
     Leave,
     Firewall,
+    SendDiagnostics { id: String },
     Start(u64),
     Stop,
     PopOut(u64),
@@ -133,6 +134,8 @@ pub enum Intent {
     Watch { peer: u64, enabled: bool },
 }
 pub struct App {
+    pub(crate) settings_tab: crate::diagnostics::Tab,
+    pub diagnostics: crate::diagnostics::Diagnostics,
     pub language_prompt:bool,
     pub signaling_setup: Option<String>,
     pub update: Option<crate::updates::Notice>,
@@ -230,6 +233,8 @@ impl App {
         })
         .collect();
         Self {
+            settings_tab: Default::default(),
+            diagnostics: Default::default(),
             language_prompt:false,
             signaling_setup: None,
             update: None,
@@ -458,6 +463,7 @@ impl App {
         self.notice.clear();
     }
     pub fn open_appearance(&mut self) {
+        self.settings_tab = Default::default();
         self.draft = self.config.clone();
         self.name_input = self.config.username.clone();
         self.dialog = Dialog::Appearance;

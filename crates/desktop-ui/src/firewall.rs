@@ -13,6 +13,7 @@ use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 const HELPER: &str = "--configure-firewall";
 const CHECK: &str = "--firewall-status";
+const POLICY_BLOCKED: u8 = 2;
 const SCRIPT: &str = include_str!("firewall.ps1");
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Status {
@@ -119,7 +120,7 @@ pub fn command_mode() -> Option<std::process::ExitCode> {
         Ok(status) if status.configured => std::process::ExitCode::SUCCESS,
         Ok(status) => {
             eprintln!("Firewall policy still blocks UDP: {status:?}");
-            std::process::ExitCode::FAILURE
+            std::process::ExitCode::from(POLICY_BLOCKED)
         }
         Err(error) => {
             eprintln!("Firewall setup failed: {error:#}");
@@ -147,7 +148,7 @@ struct ExecuteInfo {
     icon: *mut std::ffi::c_void,
     process: *mut std::ffi::c_void,
 }
-fn elevate(program: &Path, hwnd: usize) -> Result<()> {
+fn elevate(program: &Path, hwnd: usize) -> Result<u32> {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteExW(info: *mut ExecuteInfo) -> i32;
@@ -208,13 +209,36 @@ fn elevate(program: &Path, hwnd: usize) -> Result<()> {
         anyhow::ensure!(wait.0 == 0, "Waiting for firewall setup failed");
         let mut code = 1;
         GetExitCodeProcess(handle, &mut code)?;
-        anyhow::ensure!(
-            code == 0,
-            "Windows could not finish firewall setup. Check local/managed firewall policies, then retry."
-        );
+        Ok(code)
     }
-    Ok(())
 }
+
+fn apply_and_check(program: &Path, hwnd: usize) -> Result<Status> {
+    let code = elevate(program, hwnd)?;
+    // A successful elevated result already verified ActiveStore. An unelevated
+    // process may lack permission to read that store on some Windows setups.
+    if code == 0 {
+        return Ok(Status {
+            configured: true,
+            ..Status::default()
+        });
+    }
+    let reason = if code == u32::from(POLICY_BLOCKED) {
+        "Windows did not confirm the firewall rule.".to_owned()
+    } else {
+        format!("The Windows firewall helper failed (exit code {code}).")
+    };
+    match invoke(program, false) {
+        Ok(status) if status.configured => Ok(status),
+        Ok(status) => bail!(
+            "{reason} Active inbound UDP blocks for this app: {}. Network profiles that reject inbound allow rules: {}.",
+            status.app_udp_blocks,
+            status.restricted_profiles
+        ),
+        Err(error) => bail!("{reason} Firewall status check failed: {error:#}"),
+    }
+}
+
 pub(super) struct Firewall {
     program: PathBuf,
     preference: PathBuf,
@@ -224,6 +248,7 @@ pub(super) struct Firewall {
     open: bool,
     automatic: bool,
     busy: bool,
+    applying: bool,
 }
 impl Firewall {
     pub fn new(program: PathBuf, enabled: bool) -> Self {
@@ -244,8 +269,9 @@ impl Firewall {
             open: false,
             automatic: enabled && !dismissed,
             busy: false,
+            applying: false,
         };
-        if enabled {
+        if this.automatic {
             this.check();
         }
         this
@@ -266,8 +292,7 @@ impl Firewall {
             self.check();
         }
     }
-    fn dismiss(&mut self) {
-        self.open = false;
+    fn stop_startup_prompt(&mut self) {
         self.automatic = false;
         let result = (|| -> Result<()> {
             std::fs::create_dir_all(self.preference.parent().unwrap())?;
@@ -285,14 +310,16 @@ impl Firewall {
         }
     }
     fn allow(&mut self, hwnd: usize) {
+        self.stop_startup_prompt();
         let program = self.program.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.busy = true;
+        self.applying = true;
         self.error = None;
         tracing::info!(program=%self.program.display(),"firewall_permission_requested");
         std::thread::spawn(move || {
-            let result = elevate(&program, hwnd).and_then(|_| invoke(&program, false));
+            let result = apply_and_check(&program, hwnd);
             let _ = tx.send(result.map_err(|e| format!("{e:#}")));
         });
     }
@@ -307,10 +334,14 @@ impl Firewall {
         if let Some(result) = result {
             self.receiver = None;
             self.busy = false;
+            let applying = std::mem::take(&mut self.applying);
             match result {
                 Ok(status) => {
                     tracing::info!(program=%self.program.display(),configured=status.configured,udp_blocks=status.app_udp_blocks,restricted_profiles=status.restricted_profiles,rule=%status.rule,"firewall_status");
                     self.error = None;
+                    if applying && status.configured {
+                        self.open = false;
+                    }
                     self.status = Some(status);
                 }
                 Err(error) => {
@@ -319,6 +350,36 @@ impl Firewall {
                 }
             }
         }
+    }
+    fn copy_details(&self, ctx: &egui::Context) {
+        let log = self.preference.parent().and_then(crate::diagnostics::current_log)
+            .unwrap_or_else(|| self.preference.with_file_name("P2PShare.log"));
+        let log_state = if !p2pshare_media::diagnostics::enabled() {
+            "disabled"
+        } else {
+            match log.try_exists() {
+                Ok(true) => "present",
+                Ok(false) => "missing",
+                Err(_) => "inaccessible",
+            }
+        };
+        let status = if self.busy {
+            "checking"
+        } else if let Some(error) = &self.error {
+            error
+        } else if self.status.as_ref().is_some_and(|status| status.configured) {
+            "verified"
+        } else {
+            "rule not verified"
+        };
+        ctx.copy_text(format!(
+            "P2PShare {}\nExecutable: {}\nLog ({}): {}\nWindows Firewall: {}",
+            env!("CARGO_PKG_VERSION"),
+            self.program.display(),
+            log_state,
+            log.display(),
+            status,
+        ));
     }
     pub fn show(&mut self, ctx: &egui::Context, hwnd: usize, eligible: bool) {
         self.poll();
@@ -336,8 +397,10 @@ impl Firewall {
             ui.set_width(450.);
             ui.heading("Windows Firewall");
             ui.add_space(8.);
-            if self.busy {
-                ui.label("Checking Windows Firewall / waiting for permission…");
+            if self.applying {
+                ui.label("Waiting for Windows Firewall setup…");
+            } else if self.busy {
+                ui.label("Checking Windows Firewall…");
             } else if configured {
                 ui.label("P2PShare is allowed to receive peer media on Private and Public networks.");
             } else {
@@ -359,6 +422,9 @@ impl Firewall {
             ui.add_space(12.);
             ui.horizontal(|ui| {
                 if !self.busy && !configured {allow=ui.button("Allow through firewall").clicked();}
+                if ui.button("Copy details").clicked() {
+                    self.copy_details(ctx);
+                }
                 dismiss=ui.button(if configured {"Done"} else if self.busy {"Hide"} else {"Not now"}).clicked();
             });
         });
@@ -366,7 +432,8 @@ impl Firewall {
             self.allow(hwnd);
         }
         if dismiss {
-            self.dismiss();
+            self.open = false;
+            self.stop_startup_prompt();
         }
     }
 }
@@ -399,6 +466,33 @@ mod tests {
         assert_ne!(loaded.executable, PathBuf::from("D:/P2PShare.exe"));
     }
     #[test]
+    fn setup_attempt_disables_future_startup_prompts() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.build/firewall-tests")
+            .join(std::process::id().to_string());
+        let program = root.join("P2PShare.exe");
+        let mut dialog = Firewall::new(program.clone(), false);
+        dialog.automatic = true;
+        dialog.stop_startup_prompt();
+        assert!(!dialog.automatic);
+        let (tx, rx) = mpsc::channel();
+        dialog.open = true;
+        dialog.applying = true;
+        dialog.receiver = Some(rx);
+        tx.send(Ok(Status {
+            configured: true,
+            ..Status::default()
+        }))
+        .unwrap();
+        dialog.poll();
+        assert!(!dialog.open);
+
+        let restarted = Firewall::new(program, true);
+        assert!(!restarted.automatic);
+        assert!(restarted.receiver.is_none());
+        std::fs::remove_file(restarted.preference).unwrap();
+    }
+    #[test]
     fn firewall_dialog_fits_headlessly_without_starting_policy_or_elevation() {
         let mut dialog = Firewall {
             program: PathBuf::from("F:/P2PAPP/P2PShare.exe"),
@@ -409,6 +503,7 @@ mod tests {
             open: true,
             automatic: false,
             busy: false,
+            applying: false,
         };
         let ctx = egui::Context::default();
         for _ in 0..3 {

@@ -1,6 +1,10 @@
 #[cfg(windows)]
 mod firewall;
 #[cfg(windows)]
+mod diagnostics;
+#[cfg(windows)]
+pub use diagnostics::{start as start_run_log, log_system_info};
+#[cfg(windows)]
 mod updater;
 #[cfg(windows)]
 pub use updater::{command_mode as update_command_mode, recover_pending_update};

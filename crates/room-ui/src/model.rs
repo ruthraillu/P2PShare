@@ -48,6 +48,7 @@ pub enum Action {
     },
     DebugLogging(bool),
     CopyDebugLog,
+    SendDiagnosticRun(String),
     VideoQuality(p2pshare_media::VideoQuality),
     AudioVolume {
         participant: u64,
@@ -77,7 +78,26 @@ pub struct UiSnapshot {
     pub fullscreen: bool,
     pub mobile: bool,
 }
+pub struct DiagnosticRun {
+    pub id: String,
+    pub time: String,
+    pub status: &'static str,
+}
+pub struct DiagnosticReceipt {
+    pub id: String,
+    pub timestamp: Option<String>,
+}
+#[derive(Default)]
+pub struct DiagnosticPanel {
+    pub runs: Vec<DiagnosticRun>,
+    pub selected: Option<String>,
+    pub sending: bool,
+    pub receipt: Option<Result<DiagnosticReceipt, String>>,
+    pub configured: bool,
+}
+
 pub struct RoomUi {
+    pub diagnostic_panel: DiagnosticPanel,
     pub language:p2pshare_media::i18n::Language,
     pub language_prompt:bool,
     pub profiles:crate::mobile_profiles::Profiles,
@@ -155,6 +175,7 @@ impl RoomUi {
             playback_diagnostics: String::new(),
             stream_details: Default::default(),
             logging_enabled: false,
+            diagnostic_panel: DiagnosticPanel::default(),
             video_config_external: false,
             snapshot: UiSnapshot::default(),
             name: "You".into(),

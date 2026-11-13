@@ -37,7 +37,7 @@ fn merged_config(current: &AppConfig, input: &Config) -> anyhow::Result<AppConfi
     input.validate()?;
     let mut c = current.clone();
     c.username = input.username.trim().into();
-    c.language=input.language;
+    c.language = input.language;
     c.volume_step_percent = input.volume_step_percent;
     c.profile_setup_complete = true;
     c.theme = input.theme.clone();
@@ -252,6 +252,48 @@ impl View {
         tracing::info!("desktop_settings_saved");
         Ok(())
     }
+    pub(super) fn poll_diagnostics(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        if let Some(receiver) = &self.diagnostics_upload {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Diagnostics upload stopped".into())),
+            };
+            if let Some(result) = result {
+                self.design.diagnostics.sending = false;
+                self.design.diagnostics.result = Some(result);
+                self.diagnostics_upload = None;
+            }
+        }
+        if self.design.dialog != p2pshare_desktop_design::app::Dialog::Appearance {
+            self.diagnostics_refresh = None;
+            return;
+        }
+        if self.diagnostics_refresh.is_some_and(|last| last.elapsed().as_secs() < 1) {
+            return;
+        }
+        self.diagnostics_refresh = Some(std::time::Instant::now());
+        if let Ok(data) = p2pshare_media::portable::data_dir() {
+            self.design.diagnostics.runs = crate::diagnostics::recent(&data);
+            self.design.diagnostics.configured = crate::diagnostics::upload_url(&self.app_config.signaling_url).is_ok();
+        }
+    }
+
+    fn send_diagnostics(&mut self, id: String) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.diagnostics_upload = Some(receiver);
+        let signaling = self.app_config.signaling_url.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = p2pshare_media::portable::data_dir().map_err(anyhow::Error::from)
+                .and_then(|data| crate::diagnostics::send(&data, &signaling, &id))
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
     fn window_action(
         &mut self,
         action: p2pshare_desktop_design::chrome::WindowAction,
@@ -321,6 +363,9 @@ impl View {
                     Intent::Window(action) => self.window_action(action)?,
                     Intent::PopOut(peer) => self.popout_requests.push(peer),
                     Intent::Firewall => self.firewall.request(),
+                    Intent::SendDiagnostics { id } => {
+                        self.send_diagnostics(id);
+                    },
                     Intent::Watch { peer, enabled } => {
                         for member in self.session.snapshot().members {
                             if p2pshare_room_ui::peer_ui_id(&member.id) == peer {

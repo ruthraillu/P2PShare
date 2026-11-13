@@ -24,7 +24,7 @@ impl App {
                 (screen.width() - 80.).min(920.),
                 (screen.height() - 80.).min(660.),
             ),
-            Dialog::Appearance => vec2(760., (screen.height() - 80.).min(600.)),
+            Dialog::Appearance => vec2((screen.width() - 60.).min(760.), (screen.height() - 64.).min(520.)),
             Dialog::Crop=>vec2(620.,(screen.height()-80.).min(580.)),
             _ => vec2(430., 244.),
         };
@@ -521,19 +521,111 @@ impl App {
         ) {
             self.dialog = Dialog::None;
         }
-        let palette=self.palette();label(ui,rect(r.left(),r.top(),r.width()-50.,28.),p2pshare_media::tr!("Appearance & profile"),20.,palette.text);
-        self.profile_row(ui,rect(r.left(),r.top()+40.,r.width(),110.));
-        let r=egui::Rect::from_min_max(r.min+vec2(0.,160.),r.max);
+        use crate::diagnostics::Tab;
+        use p2pshare_media::tr;
         let p = self.palette();
-        text(ui, r.min + vec2(0., 15.), p2pshare_media::tr!("DISPLAY NAME"), 11., p.muted);
-        let field = rect(r.left(), r.top() + 36., r.width() - 222., 34.);
-        self.hits.insert("profile-name".into(), field);
-        ui.put(
-            field,
-            egui::TextEdit::singleline(&mut self.name_input)
-                .vertical_align(egui::Align::Center)
-                .char_limit(32),
-        );
+        label(ui, rect(r.left(), r.top(), r.width() - 50., 28.), tr!("Settings"), 20., p.text);
+        for (index, (tab, title)) in [
+            (Tab::Profile, tr!("Profile")),
+            (Tab::Appearance, tr!("Appearance")),
+            (Tab::Diagnostics, tr!("Diagnostics")),
+        ].into_iter().enumerate() {
+            if self.button(ui, title, rect(r.left(), r.top() + 48. + index as f32 * 39., 128., 34.), title, self.settings_tab == tab) {
+                self.settings_tab = tab;
+            }
+        }
+        let x = r.left() + 142.;
+        ui.painter().vline(x, (r.top() + 42.)..=r.bottom(), Stroke::new(1., p.border));
+        let r = egui::Rect::from_min_max(pos2(x + 14., r.top() + 44.), r.max);
+        if self.settings_tab == Tab::Diagnostics {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| self.diagnostics_panel(ui));
+            return;
+        }
+        if self.settings_tab == Tab::Profile {
+            self.profile_row(ui, rect(r.left(), r.top(), r.width(), 110.));
+            text(ui, r.min + vec2(0., 122.), tr!("DISPLAY NAME"), 11., p.muted);
+            let field = rect(r.left(), r.top() + 143., r.width(), 34.);
+            self.hits.insert("profile-name".into(), field);
+            ui.put(field, egui::TextEdit::singleline(&mut self.name_input)
+                .vertical_align(egui::Align::Center).char_limit(32));
+        } else {
+            let content = egui::Rect::from_min_max(r.min, pos2(r.right(), r.bottom() - 76.));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(content));
+                egui::ScrollArea::vertical().max_height(content.height()).show(ui, |ui| {
+                    let (_, panel) = ui.allocate_space(vec2((content.width() - 18.).max(0.), 358.));
+                    self.appearance_panel(ui, panel);
+                });
+            });
+        }
+        if !self.notice.is_empty() {
+            label(
+                ui,
+                rect(r.left(), r.bottom() - 82., r.width(), 25.),
+                &p2pshare_media::i18n::status(&self.notice).into_owned(),
+                12.,
+                p.red,
+            );
+        }
+        if self.live
+            && self.settings_tab == Tab::Profile
+            && self.button(
+                ui,
+                "firewall-setup",
+                rect(r.left(), r.bottom() - 37., 180., 37.),
+                p2pshare_media::tr!("Windows Firewall"),
+                false,
+            )
+        {
+            self.intents.push(Intent::Firewall);
+        }
+        if self.button(
+            ui,
+            "cancel-theme",
+            rect(r.right() - 201., r.bottom() - 37., 98., 37.),
+            p2pshare_media::tr!("Cancel"),
+            false,
+        ) {
+            self.dialog = Dialog::None;
+        }
+        let valid =
+            !self.name_input.trim().is_empty() && !self.name_input.chars().any(char::is_control);
+        let save = ui
+            .add_enabled_ui(valid, |ui| {
+                self.button(
+                    ui,
+                    "save-theme",
+                    rect(r.right() - 93., r.bottom() - 37., 93., 37.),
+                    p2pshare_media::tr!("Save"),
+                    true,
+                )
+            })
+            .inner;
+        if save {
+            let previous = self.config.clone();
+            self.config.theme = self.draft.theme.clone();
+            self.config.language = self.draft.language;
+            self.config.username = self.name_input.trim().into();
+            if self.save() {
+                if let Some(avatar)=self.pending_avatar.take(){self.intents.push(Intent::SaveAvatar(avatar));}
+                self.dialog = Dialog::None;
+            } else {
+                self.config = previous;
+            }
+        }
+    }
+    fn appearance_panel(&mut self, ui: &mut Ui, r: egui::Rect) {
+        let p = self.palette();
+        use p2pshare_media::{i18n::Language, tr};
+        ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+            ui.label(tr!("Language"));
+            let language = self.draft.language.get_or_insert_with(Language::default);
+            let selected = match language { Language::English => "English", Language::PtBr => "Português (Brasil)" };
+            egui::ComboBox::from_id_salt("settings-language").selected_text(selected).show_ui(ui, |ui| {
+                ui.selectable_value(language, Language::English, "English");
+                ui.selectable_value(language, Language::PtBr, "Português (Brasil)");
+            });
+        });
         if self.button(
             ui,
             "theme-default",
@@ -583,7 +675,7 @@ impl App {
             let col = n / 6;
             let row = n % 6;
             let x = r.left() + col as f32 * (r.width() / 2. + 8.);
-            let y = r.top() + 93. + row as f32 * 39.;
+            let y = r.top() + 80. + row as f32 * 39.;
             text(ui, pos2(x, y + 6.), title, 13., p.text);
             let area = rect(x + r.width() / 2. - 79., y, 54., 29.);
             let mut c = color(value).unwrap();
@@ -599,7 +691,7 @@ impl App {
         );
         text(
             ui,
-            pos2(r.left(), r.top() + 345.),
+            pos2(r.left(), r.top() + 332.),
             &p2pshare_media::trf!(
                 "Text contrast  {contrast:.1}:1{}",
                 if contrast < 4.5 {
@@ -611,59 +703,6 @@ impl App {
             12.,
             if contrast < 4.5 { p.red } else { p.muted },
         );
-        if !self.notice.is_empty() {
-            label(
-                ui,
-                rect(r.left(), r.bottom() - 82., r.width(), 25.),
-                &p2pshare_media::i18n::status(&self.notice).into_owned(),
-                12.,
-                p.red,
-            );
-        }
-        if self.live
-            && self.button(
-                ui,
-                "firewall-setup",
-                rect(r.left(), r.bottom() - 37., 180., 37.),
-                p2pshare_media::tr!("Windows Firewall"),
-                false,
-            )
-        {
-            self.intents.push(Intent::Firewall);
-        }
-        if self.button(
-            ui,
-            "cancel-theme",
-            rect(r.right() - 256., r.bottom() - 37., 98., 37.),
-            p2pshare_media::tr!("Cancel"),
-            false,
-        ) {
-            self.dialog = Dialog::None;
-        }
-        let valid =
-            !self.name_input.trim().is_empty() && !self.name_input.chars().any(char::is_control);
-        let save = ui
-            .add_enabled_ui(valid, |ui| {
-                self.button(
-                    ui,
-                    "save-theme",
-                    rect(r.right() - 148., r.bottom() - 37., 148., 37.),
-                    p2pshare_media::tr!("Save appearance"),
-                    true,
-                )
-            })
-            .inner;
-        if save {
-            let previous = self.config.clone();
-            self.config.theme = self.draft.theme.clone();
-            self.config.username = self.name_input.trim().into();
-            if self.save() {
-                if let Some(avatar)=self.pending_avatar.take(){self.intents.push(Intent::SaveAvatar(avatar));}
-                self.dialog = Dialog::None;
-            } else {
-                self.config = previous;
-            }
-        }
     }
     fn room_dialog(&mut self, ui: &mut Ui, r: egui::Rect) {
         self.heading(

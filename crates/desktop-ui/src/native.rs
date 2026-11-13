@@ -301,6 +301,8 @@ struct View {
     design: p2pshare_desktop_design::app::App,
     app_config: p2pshare_session::AppConfig,
     firewall: crate::firewall::Firewall,
+    pub(super) diagnostics_upload: Option<std::sync::mpsc::Receiver<std::result::Result<p2pshare_desktop_design::diagnostics::Receipt, String>>>,
+    pub(super) diagnostics_refresh: Option<Instant>,
     config_path: std::path::PathBuf,
     thumbnails: crate::thumbnails::Thumbnails,
     preview_textures: HashMap<u64, egui::TextureHandle>,
@@ -506,6 +508,8 @@ impl View {
             ui,
             design,
             app_config,
+            diagnostics_upload: None,
+            diagnostics_refresh: None,
             firewall: crate::firewall::Firewall::new(
                 std::env::current_exe()?,
                 !smoke && !capture_smoke,
@@ -710,7 +714,7 @@ impl View {
         match action {
             Action::SetLanguage(_)=>{},
             Action::ChooseAvatar|Action::SaveAvatar(_)|Action::RemoveAvatar=>{},
-            Action::DebugLogging(_) | Action::CopyDebugLog => {}
+            Action::DebugLogging(_) | Action::CopyDebugLog | Action::SendDiagnosticRun(_) => {}
             Action::Watch {
                 participant,
                 enabled,
@@ -1045,6 +1049,7 @@ impl View {
         if !legacy {
             self.sync_design();
             self.updater.poll(&mut self.design.update);
+            self.poll_diagnostics();
         }
         let output = self
             .ctx

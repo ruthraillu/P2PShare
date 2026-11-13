@@ -289,5 +289,19 @@
   "Only you can see this nickname.": "Só você vê esse apelido.",
   "Remove nickname": "Remover apelido",
   "Could not save nickname.": "Não foi possível salvar o apelido.",
-  "Room is full. Waiting for a spot…": "A sala está cheia. Aguardando uma vaga…"
+  "Room is full. Waiting for a spot…": "A sala está cheia. Aguardando uma vaga…",
+  "Appearance": "Aparência",
+  "Diagnostics": "Diagnóstico",
+  "Recent runs": "Sessões recentes",
+  "No diagnostic runs yet.": "Nenhuma sessão de diagnóstico.",
+  "Set a secure signaling server to send diagnostics.": "Configure um servidor de sinalização seguro para enviar diagnósticos.",
+  "Diagnostics uploads are unavailable on this signaling server": "O envio de diagnósticos está indisponível neste servidor.",
+  "The diagnostics server reached its daily upload limit": "O servidor atingiu o limite diário de envios.",
+  "Send diagnostics": "Enviar diagnóstico",
+  "Sending diagnostics…": "Enviando diagnóstico…",
+  "Report ID": "Código do relatório",
+  "Diagnostics sent": "Diagnóstico enviado",
+  "Running": "Em execução",
+  "Completed": "Concluída",
+  "Ended unexpectedly": "Encerrada inesperadamente"
 }

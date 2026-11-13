@@ -2831,6 +2831,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lz4_flex"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "mac-addr"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3822,27 +3831,33 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-android"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "android_logger",
  "anyhow",
+ "chrono",
  "eframe",
  "glow",
  "jni 0.21.1",
  "log",
+ "lz4_flex",
  "p2pshare-media",
  "p2pshare-room-ui",
  "p2pshare-session",
+ "reqwest",
+ "rustls",
  "semver",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
  "winit",
 ]
 
 [[package]]
 name = "p2pshare-codecs-windows"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "cc",
@@ -3857,14 +3872,14 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-connectivity"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "p2pshare-protocol",
 ]
 
 [[package]]
 name = "p2pshare-control-iroh"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3877,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-core"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "p2pshare-media",
  "p2pshare-protocol",
@@ -3885,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-desktop"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "p2pshare-desktop-ui",
  "p2pshare-media",
@@ -3896,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-desktop-design"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "egui",
@@ -3908,7 +3923,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-desktop-ui"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3916,6 +3931,7 @@ dependencies = [
  "egui",
  "egui-directx11",
  "egui-winit",
+ "lz4_flex",
  "p2pshare-codecs-windows",
  "p2pshare-desktop-design",
  "p2pshare-media",
@@ -3939,7 +3955,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-discovery"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3960,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-media"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "image",
@@ -3974,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-platform-windows"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "p2pshare-media",
  "tracing",
@@ -3983,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-protocol"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "serde",
  "uuid",
@@ -3991,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-room-ui"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "egui",
  "p2pshare-media",
@@ -3999,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-rtc"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "p2pshare-media",
@@ -4011,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-session"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4039,11 +4055,11 @@ dependencies = [
 
 [[package]]
 name = "p2pshare-signaling"
-version = "0.13.1"
+version = "0.13.2"
 
 [[package]]
 name = "p2pshare-topology"
-version = "0.13.1"
+version = "0.13.2"
 
 [[package]]
 name = "p384"
@@ -5849,6 +5865,12 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"

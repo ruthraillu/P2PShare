@@ -490,6 +490,24 @@ pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeDebugLog(
         p2pshare_media::diagnostics::append(&String::from(text));
     }
 }
+static DIAGNOSTIC_DEVICE: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn diagnostic_device() -> String {
+    DIAGNOSTIC_DEVICE.get().cloned().unwrap_or_else(|| "Android".into())
+}
+
+fn log_android_system(bridge: &Bridge) {
+    let _ = bridge.env(|env| {
+        let model = env.get_static_field("android/os/Build", "MODEL", "Ljava/lang/String;")?.l()?;
+        let model: String = env.get_string(&JString::from(model))?.into();
+        let _ = DIAGNOSTIC_DEVICE.set(model.clone());
+        let release = env.get_static_field("android/os/Build$VERSION", "RELEASE", "Ljava/lang/String;")?.l()?;
+        let release: String = env.get_string(&JString::from(release))?.into();
+        let api = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
+        tracing::warn!(%model, android_release=%release, api, version=env!("CARGO_PKG_VERSION"), "android_diagnostics_system");
+        Ok(())
+    });
+}
 pub fn run(app: winit::platform::android::activity::AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
@@ -497,7 +515,7 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
     let subscriber = tracing_subscriber::fmt()
         .json()
         .with_ansi(false)
-        .with_env_filter("warn,p2pshare_session=info,p2pshare_rtc=info")
+        .with_env_filter("warn,p2pshare_session=info,p2pshare_rtc=info,p2pshare_android=info,p2pshare_media::diagnostics=info")
         .with_writer(|| p2pshare_media::diagnostics::BufferWriter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
@@ -509,6 +527,19 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
             .join("identity.key");
         let config_path = identity.with_file_name("config.toml");
         let config = p2pshare_session::AppConfig::load_or_create(&config_path, "Android")?;
+        let data = identity.parent().ok_or("Android data directory unavailable")?.to_owned();
+        let archive = match crate::diagnostics::start(&data) {
+            Ok((log, guard)) => {
+                p2pshare_media::diagnostics::set_archive(Some(Box::new(log)));
+                Some(guard)
+            }
+            Err(error) => {
+                log::warn!("Diagnostics archive unavailable: {error:#}");
+                None
+            }
+        };
+        p2pshare_media::diagnostics::set_enabled(config.logging_enabled);
+        log_android_system(&bridge);
         let _ = CONFIG_PATH.set(config_path);
         let session = Arc::new(Session::start_cloudflare(
             identity,
@@ -530,7 +561,7 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
             ..Default::default()
         };
         options.glow_options.vsync = true;
-        eframe::run_native(
+        let run_result = eframe::run_native(
             "P2PShare",
             options,
             Box::new(move |cc| {
@@ -543,6 +574,12 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
                 room.set_platform(Platform::Android);
                 room.language=config.language.unwrap_or_default();room.language_prompt=config.language.is_none();
                 let _=bridge.env(|env|{let code=env.new_string(room.language.code())?;env.call_method(bridge.activity.as_obj(),"setUiLanguage","(Ljava/lang/String;)V",&[JValue::Object(code.as_ref())])?;Ok(())});
+                room.logging_enabled = config.logging_enabled;
+                let _ = bridge.env(|env| {
+                    env.call_method(bridge.activity.as_obj(), "setDebugLogging", "(Z)V",
+                        &[JValue::Bool(config.logging_enabled as u8)])?;
+                    Ok(())
+                });
                 room.name = config.username.clone();
                 room.room_name = config.room_name.clone();
                 room.playback_buffer_ms=config.playback.buffer_ms;
@@ -562,12 +599,20 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
                     bridge,
                     gpu,
                     diagnostics_at: std::time::Instant::now(),
+                    report_data: data,
+                    report_refresh: None,
+                    report_upload: None,
                     available_update: None,
                     resume_epoch: RESUME_EPOCH.load(Ordering::Acquire),
                     preview_textures: HashMap::new(),
                 }))
             }),
-        )?;
+        );
+        p2pshare_media::diagnostics::set_archive(None);
+        if run_result.is_ok() && let Some(archive) = archive {
+            let _ = archive.finish();
+        }
+        run_result?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -664,12 +709,37 @@ struct AndroidUi {
     _audio: audio::AudioReceiver,
     gpu: Gpu,
     diagnostics_at: std::time::Instant,
+    report_data: std::path::PathBuf,
+    report_refresh: Option<std::time::Instant>,
+    report_upload: Option<std::sync::mpsc::Receiver<Result<p2pshare_room_ui::DiagnosticReceipt, String>>>,
     available_update: Option<semver::Version>,
     resume_epoch: u64,
     preview_textures: HashMap<String, egui::TextureHandle>,
 }
 impl eframe::App for AndroidUi {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
+        use std::sync::mpsc::TryRecvError;
+        let diagnostics = &mut self.room.diagnostic_panel;
+        if let Some(upload) = &self.report_upload {
+            let result = match upload.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Diagnostics upload stopped".into())),
+            };
+            if let Some(result) = result {
+                diagnostics.receipt = Some(result);
+                diagnostics.sending = false;
+                self.report_upload = None;
+            }
+        }
+        if self.report_refresh.is_none_or(|last| last.elapsed().as_secs() >= 2) {
+            self.report_refresh = Some(std::time::Instant::now());
+            diagnostics.runs = crate::diagnostics::recent(&self.report_data);
+            diagnostics.configured = CONFIG_PATH.get().and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| p2pshare_session::AppConfig::parse(&text).ok())
+                .is_some_and(|config| crate::diagnostics::upload_url(&config.signaling_url).is_ok());
+        }
+
         {
             let mut platform = platform_input().lock().unwrap();
             self.room
@@ -838,6 +908,7 @@ impl eframe::App for AndroidUi {
                 }
                 Action::DebugLogging(enabled) => {
                     p2pshare_media::diagnostics::set_enabled(enabled);
+                    if enabled { log_android_system(&self.bridge); }
                     p2pshare_media::diagnostics::append(concat!(
                         "version=",
                         env!("CARGO_PKG_VERSION"),
@@ -851,6 +922,21 @@ impl eframe::App for AndroidUi {
                             &[JValue::Bool(enabled as u8)],
                         )?;
                         Ok(())
+                    });
+                }
+                Action::SendDiagnosticRun(id) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.report_upload = Some(rx);
+                    let data = self.report_data.clone();
+                    let ctx = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let result = (|| -> anyhow::Result<_> {
+                            let path = CONFIG_PATH.get().ok_or_else(|| anyhow::anyhow!("Configuration unavailable"))?;
+                            let config = p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
+                            crate::diagnostics::send(&data, &config.signaling_url, &id)
+                        })().map_err(|error| format!("{error:#}"));
+                        let _ = tx.send(result);
+                        ctx.request_repaint();
                     });
                 }
                 Action::CopyDebugLog => {

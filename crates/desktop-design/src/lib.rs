@@ -2,6 +2,7 @@
 pub mod app;
 pub mod config;
 mod dialogs;
+pub mod diagnostics;
 pub mod scenes;
 
 pub mod chrome;

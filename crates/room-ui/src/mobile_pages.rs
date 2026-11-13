@@ -141,6 +141,7 @@ impl RoomUi {
                 });
             });
         }
+        self.mobile_diagnostics(ui, actions);
         ui.add_space(6.0);
         egui::Frame::new().fill(PANEL).corner_radius(8).inner_margin(10).show(ui,|ui|{
             ui.set_min_width(ui.available_width());
@@ -161,11 +162,50 @@ impl RoomUi {
                     ui.add_space(12.0);ui.label(RichText::new(p2pshare_media::tr!("DIAGNOSTICS")).color(MUTED));
                     if ui.add_sized([ui.available_width(),44.0],egui::Checkbox::new(&mut self.logging_enabled,p2pshare_media::tr!("Debug logging"))).changed(){actions.push(Action::DebugLogging(self.logging_enabled));}
                     if ui.add_sized([ui.available_width(),44.0],egui::Button::new(p2pshare_media::tr!("Copy log"))).clicked(){actions.push(Action::CopyDebugLog);}
+                    self.mobile_diagnostics(ui, actions);
                     ui.add_space(12.0);egui::CollapsingHeader::new(p2pshare_media::tr!("Advanced")).show(ui,|ui|{
                         field(ui,p2pshare_media::tr!("Signaling server"),&mut self.signaling_server,2048);
                         ui.label(RichText::new(p2pshare_media::tr!("Use the same server on every device. Restart after changing it.")).small().color(MUTED));
                         if ui.button(p2pshare_media::tr!("Edit config.toml")).clicked(){actions.push(Action::EditConfig);}
                     });
+    }
+    fn mobile_diagnostics(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        use p2pshare_media::{tr, i18n::status};
+        let state = &mut self.diagnostic_panel;
+        ui.add_space(8.);
+        egui::CollapsingHeader::new(tr!("Recent runs")).default_open(true).show(ui, |ui| {
+            if state.runs.is_empty() {
+                ui.label(tr!("No diagnostic runs yet."));
+            }
+            for run in &state.runs {
+                ui.radio_value(&mut state.selected, Some(run.id.clone()),
+                    format!("{} · {}", run.time, status(run.status)));
+            }
+            if !state.configured {
+                ui.label(tr!("Set a secure signaling server to send diagnostics."));
+            }
+            let selected = state.selected.as_ref().filter(|id| state.runs.iter().any(|run| &run.id == *id));
+            if ui.add_enabled(state.configured && !state.sending && selected.is_some(),
+                egui::Button::new(tr!("Send diagnostics"))).clicked()
+                && let Some(id) = selected
+            {
+                state.sending = true;
+                state.receipt = None;
+                actions.push(Action::SendDiagnosticRun(id.clone()));
+            }
+            if state.sending {
+                ui.label(tr!("Sending diagnostics…"));
+            }
+            match &state.receipt {
+                Some(Ok(receipt)) => {
+                    ui.label(tr!("Diagnostics sent"));
+                    if let Some(timestamp) = &receipt.timestamp { ui.label(timestamp); }
+                    ui.label(format!("{} {}", tr!("Report ID"), receipt.id));
+                }
+                Some(Err(error)) => { ui.label(status(error)); }
+                None => {}
+            }
+        });
     }
     fn mobile_member(&mut self,ui:&mut Ui,p:&crate::Participant,width:f32) {
         use egui::{Rect,pos2,Align2,FontId,Color32,Sense};
