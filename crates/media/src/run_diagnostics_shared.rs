@@ -75,30 +75,47 @@ fn lock(run: &Path) -> io::Result<File> {
 
 pub struct RunLog {
     run: PathBuf,
-    file: File,
+    file: Option<File>,
     bytes: u64,
 }
 
 impl Write for RunLog {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.bytes + bytes.len() as u64 > SEGMENT_BYTES {
-            let pending = self.run.join("next.jsonl");
-            let file = File::create(&pending)?;
-            let raw = self.run.join("run.jsonl");
-            fs::rename(&raw, self.run.join("earlier.jsonl"))?;
-            if let Err(error) = fs::rename(&pending, &raw) {
-                let _ = fs::rename(self.run.join("earlier.jsonl"), &raw);
-                return Err(error);
+        let raw = self.run.join("run.jsonl");
+        if self.bytes.saturating_add(bytes.len() as u64) > SEGMENT_BYTES {
+            if let Some(mut file) = self.file.take() {
+                let _ = file.flush();
             }
-            self.file = file;
+            let earlier = self.run.join("earlier.jsonl");
+            if earlier.exists() {
+                let _ = fs::remove_file(&earlier);
+            }
+            match fs::rename(&raw, &earlier) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            self.file = Some(File::create(&raw)?);
             self.bytes = 0;
         }
-        let written = self.file.write(bytes)?;
-        self.bytes += written as u64;
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&raw)?,
+            ),
+        };
+        let written = file.write(bytes)?;
+        self.bytes = self.bytes.saturating_add(written as u64);
         Ok(written)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        if let Some(file) = &mut self.file {
+            file.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -131,7 +148,7 @@ pub fn start(data: &Path) -> Result<(RunLog, RunGuard)> {
     Ok((
         RunLog {
             run: run.clone(),
-            file,
+            file: Some(file),
             bytes: 0,
         },
         RunGuard { run, _lock: active },
@@ -214,6 +231,7 @@ fn maintain(root: &Path) -> Result<()> {
 }
 
 pub(super) fn recent(data: &Path) -> Vec<Run> {
+    let _maintenance = MAINTENANCE.lock().unwrap_or_else(|e| e.into_inner());
     let root = directory(data);
     ids(&root)
         .into_iter()
@@ -458,8 +476,17 @@ fn report(run: &Path, windows_username: Option<&str>) -> Result<Vec<u8>> {
         writeln!(output, "{}", json!({"windows_username":name}))?;
     }
     let mut ids = std::collections::HashMap::new();
-    for line in BufReader::new(input.take(MAX_RUN_BYTES)).lines() {
-        let Ok(record) = serde_json::from_str::<Value>(&line?) else {
+    let mut reader = BufReader::new(input.take(MAX_RUN_BYTES));
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(fields) = record["fields"].as_object() else {

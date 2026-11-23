@@ -7,19 +7,22 @@ New-Item -ItemType Directory -Force $download,$env:TEMP | Out-Null
 if (!(Test-Path (Join-Path $download 'android-repository.xml'))) { Invoke-WebRequest 'https://dl.google.com/android/repository/repository2-3.xml' -OutFile (Join-Path $download 'android-repository.xml') }
 $sdk=Join-Path $taskRoot '.build\android-sdk'
 New-Item -ItemType Directory -Force $sdk | Out-Null
+$curlRateArgs = if ($env:CI) { @() } else { @('--limit-rate','2M') }
 [xml]$catalog=Get-Content (Join-Path $download 'android-repository.xml') -Raw
 foreach ($package in @('platforms;android-36','build-tools;36.0.0','ndk;29.0.14206865')) {
  $entry=$catalog.'sdk-repository'.remotePackage | Where-Object path -EQ $package
  $archive=$entry.archives.archive | Where-Object { !$_. 'host-os' -or $_.'host-os' -eq 'windows' } | Select-Object -First 1
  $name=[string]$archive.complete.url
  $file=Join-Path $download $name
- $expected=$archive.complete.checksum.InnerText.Trim()
+ $checksumNode=$archive.complete.checksum
+ $expected=if ($checksumNode -is [string]) { $checksumNode.Trim() } elseif ($checksumNode -and $checksumNode.InnerText) { $checksumNode.InnerText.Trim() } else { '' }
+ if ([string]::IsNullOrWhiteSpace($expected)) { throw "Missing checksum for $package ($name)" }
  if (!(Test-Path $file) -or (Get-FileHash $file -Algorithm SHA1).Hash.ToLowerInvariant() -ne $expected.ToLowerInvariant()) {
-  Write-Output "Downloading $name (2 MB/s cap)"
-  & curl.exe --fail --location --retry 3 --limit-rate 2M --silent --show-error --output $file "https://dl.google.com/android/repository/$name"
+  Write-Output ("Downloading $name" + $(if ($env:CI) { '' } else { ' (2 MB/s cap)' }))
+  & curl.exe --fail --location --retry 3 @curlRateArgs --silent --show-error --output $file "https://dl.google.com/android/repository/$name"
   if ($LASTEXITCODE) { throw "Download failed: $name" }
  }
- if ($expected -and (Get-FileHash $file -Algorithm SHA1).Hash.ToLowerInvariant() -ne $expected.ToLowerInvariant()) { throw "Checksum failed: $name" }
+ if ((Get-FileHash $file -Algorithm SHA1).Hash.ToLowerInvariant() -ne $expected.ToLowerInvariant()) { throw "Checksum failed: $name" }
  $target=Join-Path $sdk ($package.Replace(';','\'))
  if (Test-Path $target) { Write-Output "Ready: $package"; continue }
  $extract=Join-Path $download ($name + '.extract')
@@ -39,12 +42,14 @@ $content=Get-Content $manifest -Raw
 $match=[regex]::Match($content,'(?s)\[pkg\.rust-std\.target\.aarch64-linux-android\].*?url = "([^"]+)".*?hash = "([^"]+)"')
 if (!$match.Success) { throw 'Rust Android target not in toolchain manifest' }
 $url=$match.Groups[1].Value
+$rustHash=$match.Groups[2].Value.Trim().ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($rustHash)) { throw 'Missing checksum for Rust Android target' }
 $file=Join-Path $download 'rust-std-android.tar.gz'
-if (!(Test-Path $file) -or (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match.Groups[2].Value) {
- & curl.exe --fail --location --retry 3 --limit-rate 2M --silent --show-error --output $file $url
+if (!(Test-Path $file) -or (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $rustHash) {
+ & curl.exe --fail --location --retry 3 @curlRateArgs --silent --show-error --output $file $url
  if ($LASTEXITCODE) { throw 'Rust target download failed' }
 }
-if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match.Groups[2].Value) { throw 'Rust target checksum failed' }
+if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $rustHash) { throw 'Rust target checksum failed' }
 & tar.exe -xf $file -C $download
 if ($LASTEXITCODE) { throw 'Rust target extraction failed' }
 $root=Get-Item (Join-Path $download ([IO.Path]::GetFileName($url).Replace('.tar.gz','')))

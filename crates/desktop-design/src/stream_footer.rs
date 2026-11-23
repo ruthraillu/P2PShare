@@ -155,12 +155,12 @@ impl App {
         label(ui, title_rect, &name, text_font, palette.text);
         let title_width=ui.painter().layout_no_wrap(name.clone(),FontId::proportional(text_font),palette.text).size().x;
         let eye=rect((title_rect.left()+title_width+12.0).min(title_rect.right()+6.0),name_rect.center().y-11.0,count_width,22.0);
-        let names=self.stream_viewers.get(&peer).cloned();
+        let viewers=self.stream_viewers.get(&peer).cloned();
         let response=ui.allocate_rect(eye,egui::Sense::click());
         ui.painter().rect_filled(eye,5.0,palette.hover);
         let c=pos2(eye.left()+11.0,eye.center().y);let stroke=Stroke::new(1.1,palette.accent);
         ui.painter().add(egui::Shape::line(vec![c+vec2(-7.0,0.0),c+vec2(-3.0,-4.0),c+vec2(3.0,-4.0),c+vec2(7.0,0.0),c+vec2(3.0,4.0),c+vec2(-3.0,4.0),c+vec2(-7.0,0.0)],stroke));ui.painter().circle_filled(c,2.0,palette.accent);
-        ui.painter().text(pos2(eye.right()-10.0,eye.center().y),egui::Align2::CENTER_CENTER,names.as_ref().map(|n|n.len().to_string()).unwrap_or_else(||"—".into()),FontId::proportional(11.0),palette.text);
+        ui.painter().text(pos2(eye.right()-10.0,eye.center().y),egui::Align2::CENTER_CENTER,viewers.as_ref().map(|n|n.len().to_string()).unwrap_or_else(||"—".into()),FontId::proportional(11.0),palette.text);
         self.hits.insert(format!("stream-viewers-{peer}"),eye);
         egui::Popup::from_toggle_button_response(&response)
             .frame(egui::Frame::new().fill(palette.side).stroke(Stroke::new(1.0,palette.border)).corner_radius(10).inner_margin(egui::Margin::symmetric(16,14)))
@@ -169,22 +169,22 @@ impl App {
                 ui.spacing_mut().item_spacing=vec2(0.0,0.0);
                 let (header,_)=ui.allocate_exact_size(vec2(238.0,20.0),egui::Sense::hover());
                 ui.painter().text(header.left_center(),egui::Align2::LEFT_CENTER,p2pshare_media::tr!("Viewers"),FontId::proportional(14.0),palette.text);
-                ui.painter().text(header.right_center(),egui::Align2::RIGHT_CENTER,names.as_ref().map(|n|n.len().to_string()).unwrap_or_else(||"—".into()),FontId::proportional(13.0),palette.muted);
+                ui.painter().text(header.right_center(),egui::Align2::RIGHT_CENTER,viewers.as_ref().map(|n|n.len().to_string()).unwrap_or_else(||"—".into()),FontId::proportional(13.0),palette.muted);
                 ui.add_space(8.0);
-                if let Some(names)=&names {
-                    if names.is_empty(){ui.label(egui::RichText::new(p2pshare_media::tr!("No viewers")).color(palette.muted));}
-                    egui::ScrollArea::vertical().max_height(324.0).min_scrolled_height((names.len() as f32 * 54.0).min(324.0)).auto_shrink([false,true]).show(ui,|ui| {
-                        for (index,name) in names.iter().enumerate() {
+                if let Some(viewers)=&viewers {
+                    if viewers.is_empty(){ui.label(egui::RichText::new(p2pshare_media::tr!("No viewers")).color(palette.muted));}
+                    egui::ScrollArea::vertical().max_height(324.0).min_scrolled_height((viewers.len() as f32 * 54.0).min(324.0)).auto_shrink([false,true]).show(ui,|ui| {
+                        for (index,(viewer_id,name)) in viewers.iter().enumerate() {
                             let (row,_)=ui.allocate_exact_size(vec2(ui.available_width(),54.0),egui::Sense::hover());
                             let center=pos2(row.left()+20.0,row.center().y);
                             ui.painter().circle_filled(center,20.0,palette.accent.gamma_multiply(0.65));
                             ui.painter().text(center,egui::Align2::CENTER_CENTER,name.chars().next().unwrap_or('?').to_uppercase().to_string(),FontId::proportional(17.0),palette.text);
-                            if let Some(texture)=self.members.iter().find(|m|m.name==*name||(m.id==0&&self.config.username==*name)).and_then(|m|self.avatars.get(&m.id)) {
+                            if let Some(texture)=self.avatars.get(viewer_id) {
                                 crate::profile::circle(ui.painter(),center,20.0,*texture,Rect::from_min_max(pos2(0.,0.),pos2(1.,1.)));
                             }
                             let name_rect=Rect::from_min_max(pos2(row.left()+52.0,row.top()),row.max);
                             label(ui,name_rect,name,16.0,palette.text);
-                            if ui.interact(row,ui.id().with(("viewer-name",peer,index)),egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked(){if let Some(member)=self.members.iter().find(|m|m.name==*name||(m.id==0&&self.config.username==*name)){self.profile_view=Some(member.id);self.profile_show_names=false;ui.close();}}
+                            if ui.interact(row,ui.id().with(("viewer-name",peer,index)),egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked(){if self.members.iter().any(|m|m.id==*viewer_id){self.profile_view=Some(*viewer_id);self.profile_show_names=false;ui.close();}}
                             self.regions.push((format!("viewer-avatar-{peer}-{index}"),Rect::from_center_size(center,vec2(40.0,40.0))));
                             self.regions.push((format!("viewer-name-{peer}-{index}"),name_rect));
                         }
@@ -642,7 +642,7 @@ mod watcher_tests {
  #[test]
  fn popup_lists_viewers_and_reflects_stop_updates(){
   let ctx=egui::Context::default();let mut config=crate::config::Config::default();config.username="Alex".into();let mut app=App::live(config,"grupo".into(),false);app.joined=true;app.members[0].scene=Some(0);
-  app.stream_viewers.insert(0,vec!["arthur".into(),"Maya".into(),"Theo".into()]);
+  app.stream_viewers.insert(0,vec![(10,"arthur".into()),(1,"Maya".into()),(2,"Theo".into())]);
   let render=|app:&mut App,events:Vec<egui::Event>|ctx.run_ui(egui::RawInput{screen_rect:Some(rect(0.,0.,1440.,932.)),events,..Default::default()},|ui|app.ui(ui));
   render(&mut app,vec![]);let at=app.hits["stream-viewers-0"].center();
   for pressed in [true,false]{render(&mut app,vec![egui::Event::PointerMoved(at),egui::Event::PointerButton{pos:at,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}

@@ -81,6 +81,9 @@ impl Publisher {
     pub fn health(&self) -> Health {
         self.health.lock().unwrap().clone()
     }
+    pub fn take_error(&self) -> Option<String> {
+        self.health.lock().unwrap().error.take()
+    }
 }
 impl Drop for Publisher {
     fn drop(&mut self) {
@@ -191,10 +194,9 @@ fn run(
                     let _ = reply.send(());
                 }
                 Control::Start(_source, reply) => {
-                    capture=replacement.expect("Prepared capture source");
-                    let result:Result<(),String>=Ok(());
-                    active = result.is_ok();
-                    if active {
+                    if reply.send(Ok(())).is_ok() {
+                        capture = replacement.expect("Prepared capture source");
+                        active = true;
                         session.set_stream_info(p2pshare_session::StreamInfo {
                             codec: if settings.codec == p2pshare_media::config::Codec::Auto {
                                 None
@@ -203,11 +205,17 @@ fn run(
                             },
                             bitrate_kbps: settings.bitrate_kbps,
                         });
+                        next_capture = Instant::now();
+                        next_preview = Instant::now();
+                        health.lock().unwrap().error = None;
+                    } else {
+                        if let Some(mut next) = replacement {
+                            let _ = next.stop();
+                        }
+                        active = false;
+                        session.command(Command::Unpublish);
+                        tracing::warn!("publisher_start_aborted_caller_timed_out");
                     }
-                    next_capture = Instant::now();
-                    next_preview = Instant::now();
-                    health.lock().unwrap().error = None;
-                    let _ = reply.send(result);
                 }
             }
         }
@@ -302,11 +310,16 @@ fn run(
                 }
                 if now >= next_preview {
                     if preview_renderer.is_none() {
-                        preview_renderer = Some(egui_directx11::Renderer::new(&graphics.device)?);
+                        preview_renderer = Some((
+                            egui_directx11::Renderer::new(&graphics.device)?,
+                            egui::Context::default(),
+                        ));
                     }
+                    let (renderer, ctx) = preview_renderer.as_mut().unwrap();
                     match crate::thumbnails::jpeg_snapshot(
                         &graphics,
-                        preview_renderer.as_mut().unwrap(),
+                        renderer,
+                        ctx,
                         &frame.texture,
                     ) {
                         Ok(bytes) => {

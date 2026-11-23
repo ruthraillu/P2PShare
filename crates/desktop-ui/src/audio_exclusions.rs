@@ -22,6 +22,21 @@ struct Process {
     name: String,
     born: u64,
 }
+fn process_born(pid: u32) -> Option<u64> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut born, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let valid =
+            GetProcessTimes(handle, &mut born, &mut exit, &mut kernel, &mut user).is_ok();
+        let _ = CloseHandle(handle);
+        valid.then_some(((born.dwHighDateTime as u64) << 32) | born.dwLowDateTime as u64)
+    }
+}
 fn process_snapshot() -> Result<HashMap<u32, Process>> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
@@ -39,27 +54,11 @@ fn process_snapshot() -> Result<HashMap<u32, Process>> {
                     .iter()
                     .position(|c| *c == 0)
                     .unwrap_or(entry.szExeFile.len());
-                let mut node = Process {
+                let node = Process {
                     parent: entry.th32ParentProcessID,
                     name: String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase(),
-                    born: 0,
+                    born: process_born(pid).unwrap_or(0),
                 };
-                if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                    let (mut born, mut exit, mut kernel, mut user) = (
-                        FILETIME::default(),
-                        FILETIME::default(),
-                        FILETIME::default(),
-                        FILETIME::default(),
-                    );
-                    let valid =
-                        GetProcessTimes(handle, &mut born, &mut exit, &mut kernel, &mut user)
-                            .is_ok();
-                    let _ = CloseHandle(handle);
-                    if valid {
-                        node.born =
-                            ((born.dwHighDateTime as u64) << 32) | born.dwLowDateTime as u64;
-                    }
-                }
                 result.insert(pid, node);
                 match Process32NextW(snapshot, &mut entry) {
                     Ok(()) => {}
@@ -232,11 +231,27 @@ impl Discovery {
                     return;
                 }
                 let _apartment = super::Apartment;
+                let mut warned_inaccessible = BTreeSet::new();
                 while !stopped.load(Ordering::Acquire) {
                     let result = (|| -> Result<_> {
                         let active = active_audio_pids()?;
                         let tree = process_snapshot()?;
-                        let roots = selected(&tree, &active, &names, std::process::id());
+                        let own = std::process::id();
+                        for pid in &active {
+                            if *pid != own
+                                && let Some(process) = tree.get(pid)
+                                && process.born == 0
+                                && warned_inaccessible.insert(*pid)
+                            {
+                                tracing::warn!(
+                                    pid,
+                                    process = %process.name,
+                                    "audio_filtered_process_inaccessible_creation_time"
+                                );
+                            }
+                        }
+                        warned_inaccessible.retain(|pid| active.contains(pid));
+                        let roots = selected(&tree, &active, &names, own);
                         ensure!(roots.len() <= 32, "Too many allowed audio process trees");
                         Ok(roots.keys().map(|pid| (*pid, tree[pid].clone())).collect())
                     })();
@@ -313,14 +328,10 @@ impl FilteredCapture {
             .iter()
             .map(|(pid, p)| (*pid, p.born))
             .collect::<BTreeMap<_, _>>();
-        let changed = planned != self.planned;
         self.planned = planned;
         self.inputs
             .retain(|pid, input| targets.get(pid).is_some_and(|p| p.born == input.born));
         self.retry.retain(|pid, _| targets.contains_key(pid));
-        if changed {
-            self.timeline.blocks.clear();
-        }
         for (pid, process) in targets {
             let born = process.born;
             if self.inputs.contains_key(&pid)
@@ -328,8 +339,17 @@ impl FilteredCapture {
             {
                 continue;
             }
+            if process_born(pid) != Some(born) {
+                tracing::debug!(pid, process = %process.name, "audio_filtered_process_changed_before_open");
+                continue;
+            }
             match Device::for_capture(CaptureTarget::Process(pid)) {
                 Ok(device) => {
+                    if process_born(pid) != Some(born) {
+                        tracing::warn!(pid, process = %process.name, "audio_filtered_process_reused_during_open");
+                        drop(device);
+                        continue;
+                    }
                     tracing::info!(pid,process=%process.name,"audio_filtered_process_started");
                     self.inputs.insert(pid, Input { born, device });
                     self.retry.remove(&pid);

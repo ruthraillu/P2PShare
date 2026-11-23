@@ -27,10 +27,10 @@ impl<B: PreviewBackend> LocalPreview<B> {
     }
     pub fn start(&mut self, source: &CaptureSource) -> Result<(), B::Error> {
         self.stop()?;
+        self.source = Some(source.clone());
         if self.visible {
             self.backend.start(source)?;
         }
-        self.source = Some(source.clone());
         Ok(())
     }
     pub fn set_cursor_capture(&mut self,enabled:bool)->Result<(),B::Error>{self.backend.set_cursor_capture(enabled)}

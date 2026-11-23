@@ -73,6 +73,18 @@ unsafe extern "system" fn monitor_callback(
         TRUE
     }
 }
+const DWMWA_CLOAKED: u32 = 14;
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmGetWindowAttribute(
+        hwnd: *mut std::ffi::c_void,
+        dw_attribute: u32,
+        pv_attribute: *mut std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
+}
+
 unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
     // SAFETY: Win32 validates window handles; callback data is live during EnumWindows.
     unsafe {
@@ -84,6 +96,16 @@ unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
             return TRUE;
         }
         if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+            return TRUE;
+        }
+        let mut cloaked: u32 = 0;
+        let hr = DwmGetWindowAttribute(
+            hwnd.0,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        if hr >= 0 && cloaked != 0 {
             return TRUE;
         }
         let mut text = [0u16; 512];

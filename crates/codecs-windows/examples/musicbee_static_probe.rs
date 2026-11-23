@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(2));
     };
     let size = raw.size;
-    let base = raw.bytes;
+    let base = &raw.bytes;
     println!(
         "MusicBee snapshot: {}x{}, 6 Mbps HEVC/60fps model; synthetic cursor only",
         size.width, size.height

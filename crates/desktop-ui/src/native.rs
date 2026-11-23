@@ -101,6 +101,29 @@ impl Runner {
         self.error = Some(error.to_string());
         event_loop.exit();
     }
+    pub(super) fn tick_detached_only(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(view) = &mut self.view {
+            view.presented_last_frame = false;
+            view.poll_network();
+            if let Err(error) = view.poll_capture() {
+                tracing::error!(%error, "Capture stopped");
+                let _ = view.capture.stop();
+                view.clear_capture();
+                view.ui.status = format!("Capture error: {error}");
+            }
+            if !view.smoke && !view.capture_smoke {
+                view.sync_design();
+                view.updater.poll(&mut view.design.update);
+                view.poll_diagnostics();
+                if let Err(error) = view.flush_texture_deltas() {
+                    tracing::warn!(%error, "detached_texture_delta_flush_failed");
+                }
+            }
+        }
+        if let Err(error) = self.update_popouts(event_loop) {
+            tracing::warn!(%error, "popout_update_failed");
+        }
+    }
 }
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -246,12 +269,41 @@ impl ApplicationHandler for Runner {
         let popout_live = self.popouts.values().any(|child| {
             !child.occluded && child.target.is_some() && child.app.has_visible_live_video()
         });
+        let main_visible = self
+            .view
+            .as_ref()
+            .is_some_and(|view| !view.occluded && view.target.is_some());
+        if !self.popouts.is_empty() && !main_visible {
+            // Main window is minimized or occluded, so Win32 will not deliver WM_PAINT to it.
+            // Drive network/decode/popout updates directly with WaitUntil pacing.
+            let interval = if popout_live {
+                Duration::from_millis(8)
+            } else {
+                Duration::from_millis(16)
+            };
+            let due = self
+                .view
+                .as_ref()
+                .is_some_and(|view| Instant::now() >= view.next_redraw);
+            if due {
+                if let Some(view) = &mut self.view {
+                    view.window_memory.flush(false);
+                }
+                self.tick_detached_only(event_loop);
+                if let Some(view) = &mut self.view {
+                    view.next_redraw = Instant::now() + interval;
+                }
+            }
+            if let Some(view) = &self.view {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(view.next_redraw));
+            }
+            return;
+        }
         if let Some(view) = &mut self.view {
             view.window_memory.flush(false);
             if (view.ui.in_room || view.ui.capture_running)
                 && ((view.smoke || view.capture_smoke || view.design.has_visible_live_video())
-                    && !view.occluded
-                    && view.target.is_some()
+                    && main_visible
                     || popout_live)
             {
                 // Present(1) already limits rendering to display refresh. An additional
@@ -274,7 +326,22 @@ impl ApplicationHandler for Runner {
                 Duration::from_millis(200)
             };
             if Instant::now() >= view.next_redraw {
-                view.request_redraw();
+                if main_visible {
+                    view.request_redraw();
+                } else {
+                    view.poll_network();
+                    if let Err(error) = view.poll_capture() {
+                        tracing::error!(%error, "Capture stopped");
+                        let _ = view.capture.stop();
+                        view.clear_capture();
+                        view.ui.status = format!("Capture error: {error}");
+                    }
+                    if !view.smoke && !view.capture_smoke {
+                        view.sync_design();
+                        view.updater.poll(&mut view.design.update);
+                        view.poll_diagnostics();
+                    }
+                }
                 view.next_redraw = Instant::now() + interval;
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(view.next_redraw));
@@ -282,6 +349,10 @@ impl ApplicationHandler for Runner {
     }
 }
 struct View {
+    target: Option<ID3D11RenderTargetView>,
+    dummy_target: Option<ID3D11RenderTargetView>,
+    swap: IDXGISwapChain1,
+    renderer: egui_directx11::Renderer,
     window: Window,
     close_requested: bool,
     updater: crate::updater::Updater,
@@ -290,10 +361,7 @@ struct View {
     window_memory: crate::window_memory::WindowMemory,
     hwnd: HWND,
     graphics: GraphicsDevice,
-    swap: IDXGISwapChain1,
-    target: Option<ID3D11RenderTargetView>,
     graphics_retry:Option<Instant>,
-    renderer: egui_directx11::Renderer,
     ctx: egui::Context,
     input: egui_winit::State,
     capture: crate::local_preview::LocalPreview<WindowsCapture>,
@@ -307,7 +375,7 @@ struct View {
     thumbnails: crate::thumbnails::Thumbnails,
     preview_textures: HashMap<u64, egui::TextureHandle>,
     picker_open: bool,
-    active_source: Option<u64>,
+    active_source: Option<p2pshare_media::CaptureSource>,
     session: Arc<Session>,
     codecs: CodecWorker,
     publisher: crate::publisher::Publisher,
@@ -325,6 +393,7 @@ struct View {
     room_previews: HashMap<String, egui::TextureHandle>,
     avatars:profile::Store,
     preview_epoch: u64,
+    flushed_preview_epoch: u64,
     last_members: Vec<String>,
     published_size: p2pshare_media::Dimensions,
     invite_out: Option<std::path::PathBuf>,
@@ -490,6 +559,10 @@ impl View {
         );
         let invite_out = arg("--invite-out").map(std::path::PathBuf::from);
         let mut view = Self {
+            target: None,
+            dummy_target: None,
+            swap,
+            renderer,
             window,
             close_requested: false,
             updater: crate::updater::Updater::new(p2pshare_media::portable::data_dir()?, !smoke && !capture_smoke),
@@ -498,10 +571,7 @@ impl View {
             window_memory,
             hwnd,
             graphics,
-            swap,
-            target: None,
             graphics_retry:None,
-            renderer,
             ctx,
             input,
             capture,
@@ -542,6 +612,7 @@ impl View {
             room_previews: HashMap::new(),
             avatars:Default::default(),
             preview_epoch: 0,
+            flushed_preview_epoch: 0,
             last_members: vec![],
             published_size: p2pshare_media::Dimensions::default(),
             registered: None,
@@ -638,7 +709,54 @@ impl View {
         }
         self.create_target()
     }
+    fn flush_texture_deltas(&mut self) -> Result<()> {
+        if self.flushed_preview_epoch == self.preview_epoch {
+            return Ok(());
+        }
+        let output = self.ctx.run_ui(egui::RawInput::default(), |_| {});
+        let (mut output, _, _) = egui_directx11::split_output(output);
+        output.shapes.clear();
+        if !output.textures_delta.is_empty() {
+            if self.target.is_none() && self.dummy_target.is_none() {
+                unsafe {
+                    let mut tex = None;
+                    self.graphics.device.CreateTexture2D(
+                        &D3D11_TEXTURE2D_DESC {
+                            Width: 1,
+                            Height: 1,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Usage: D3D11_USAGE_DEFAULT,
+                            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                            ..Default::default()
+                        },
+                        None,
+                        Some(&mut tex),
+                    )?;
+                    let mut rtv = None;
+                    self.graphics.device.CreateRenderTargetView(
+                        tex.as_ref().unwrap(),
+                        None,
+                        Some(&mut rtv),
+                    )?;
+                    self.dummy_target = rtv;
+                }
+            }
+            if let Some(rtv) = self.target.as_ref().or(self.dummy_target.as_ref()) {
+                self.renderer
+                    .render(&self.graphics.context, rtv, &self.ctx, output)?;
+            }
+        }
+        self.flushed_preview_epoch = self.preview_epoch;
+        Ok(())
+    }
     fn clear_capture(&mut self) {
+        self.active_source = None;
         let _ = self.capture.stop();
         if let Some(audio) = &self.audio {
             audio.set_source(None);
@@ -781,7 +899,14 @@ impl View {
                 self.ui.sources = enumerate_sources(Some(self.hwnd))?;
             }
             Action::StartCapture(id) => {
-                if self.ui.capture_running && self.active_source==Some(id){let health=self.publisher.health();if !health.source_closed&&health.error.is_none(){return Ok(());}}
+                if self.ui.capture_running
+                    && self.active_source.as_ref().is_some_and(|s| s.id == id)
+                {
+                    let health = self.publisher.health();
+                    if !health.source_closed && health.error.is_none() {
+                        return Ok(());
+                    }
+                }
                 if let Some(source) = self.ui.sources.iter().find(|s| s.id == id).cloned() {
                     // Publisher validates the replacement before releasing the old capture.
                     // Keep the room publication and viewers intact throughout the handoff.
@@ -791,7 +916,7 @@ impl View {
                     self.capture.set_cursor_capture(self.stream_config.show_cursor)?;
                     self.capture.set_visible(!self.design.local_preview_hidden)?;
                     if let Err(error)=self.capture.start(&source){tracing::warn!(%error,"source_switch_local_preview_failed");}
-                    self.active_source=Some(id);
+                    self.active_source = Some(source.clone());
                     if let Some(audio) = &self.audio {
                         audio.set_source(Some(&source));
                     }
@@ -882,7 +1007,7 @@ impl View {
             self.clear_capture();
             self.ui.status = "The shared window closed. Choose another screen.".into();
         }
-        if let Some(error) = health.error {
+        if let Some(error) = self.publisher.take_error() {
             if self.ui.capture_running {
                 let _ = self.capture.stop();
                 self.clear_capture();
@@ -1036,6 +1161,7 @@ impl View {
         }
         if self.target.is_none() || self.occluded {
             self.sync_design();
+            let _ = self.flush_texture_deltas();
             return Ok(());
         }
         self.update_latency
@@ -1050,6 +1176,7 @@ impl View {
             self.sync_design();
             self.updater.poll(&mut self.design.update);
             self.poll_diagnostics();
+            self.design.firewall_open = self.firewall.is_open();
         }
         let output = self
             .ctx
@@ -1062,6 +1189,7 @@ impl View {
                         ui.ctx(),
                         self.hwnd.0 as usize,
                         self.design.dialog == p2pshare_desktop_design::app::Dialog::None
+                            && self.design.profile_view.is_none()
                             && !self.design.fullscreen && !self.design.update_open,
                     );
                 }
@@ -1084,6 +1212,7 @@ impl View {
             }
             self.renderer
                 .render(&self.graphics.context, target, &self.ctx, output)?;
+            self.flushed_preview_epoch = self.preview_epoch;
         } else {
             self.skipped_presentations += 1;
         }

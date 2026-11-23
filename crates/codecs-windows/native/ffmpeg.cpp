@@ -78,6 +78,7 @@ static void codec_log(void *, int level, const char *format, va_list args) {
     ReleaseSRWLockExclusive(&diagnostics_lock);
 }
 extern "C" int ps_ff_diagnostics(char *out, int cap) {
+    last_diagnostic[0] = 0;
     AcquireSRWLockExclusive(&diagnostics_lock);
     int length = (int)strlen(diagnostics);
     if (length >= cap) length = cap - 1;
@@ -85,10 +86,13 @@ extern "C" int ps_ff_diagnostics(char *out, int cap) {
     ReleaseSRWLockExclusive(&diagnostics_lock); return length;
 }
 extern "C" int ps_ff_init(const wchar_t *util, const wchar_t *codec, const wchar_t *scale, char *error, int cap) {
+    last_diagnostic[0] = 0;
     HMODULE avutil = LoadLibraryExW(util, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!avutil) { snprintf(error, cap, "Cannot load bundled avutil DLL (Windows error %lu)", GetLastError()); return -1; }
     HMODULE avcodec = LoadLibraryExW(codec, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!avcodec) { snprintf(error, cap, "Cannot load bundled avcodec DLL (Windows error %lu)", GetLastError()); return -1; }
     HMODULE swscale = LoadLibraryExW(scale, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!avutil || !avcodec || !swscale) { snprintf(error, cap, "Cannot load bundled FFmpeg DLLs (Windows error %lu)", GetLastError()); return -1; }
+    if (!swscale) { snprintf(error, cap, "Cannot load bundled swscale DLL (Windows error %lu)", GetLastError()); return -1; }
     p_avcodec_version = reinterpret_cast<decltype(p_avcodec_version)>(GetProcAddress(avcodec, "avcodec_version")); if (!p_avcodec_version) { snprintf(error, cap, "Missing FFmpeg symbol avcodec_version"); return -1; }
     p_avcodec_find_encoder_by_name = reinterpret_cast<decltype(p_avcodec_find_encoder_by_name)>(GetProcAddress(avcodec, "avcodec_find_encoder_by_name")); if (!p_avcodec_find_encoder_by_name) { snprintf(error, cap, "Missing FFmpeg symbol avcodec_find_encoder_by_name"); return -1; }
     p_avcodec_find_decoder = reinterpret_cast<decltype(p_avcodec_find_decoder)>(GetProcAddress(avcodec, "avcodec_find_decoder")); if (!p_avcodec_find_decoder) { snprintf(error, cap, "Missing FFmpeg symbol avcodec_find_decoder"); return -1; }
@@ -111,7 +115,7 @@ extern "C" int ps_ff_init(const wchar_t *util, const wchar_t *codec, const wchar
     p_av_frame_alloc = reinterpret_cast<decltype(p_av_frame_alloc)>(GetProcAddress(avutil, "av_frame_alloc")); if (!p_av_frame_alloc) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_alloc"); return -1; }
     p_av_frame_free = reinterpret_cast<decltype(p_av_frame_free)>(GetProcAddress(avutil, "av_frame_free")); if (!p_av_frame_free) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_free"); return -1; }
     p_av_frame_unref = reinterpret_cast<decltype(p_av_frame_unref)>(GetProcAddress(avutil, "av_frame_unref")); if (!p_av_frame_unref) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_unref"); return -1; }
-    p_av_frame_move_ref = reinterpret_cast<decltype(p_av_frame_move_ref)>(GetProcAddress(avutil, "av_frame_move_ref")); if (!p_av_frame_move_ref) return -1;
+    p_av_frame_move_ref = reinterpret_cast<decltype(p_av_frame_move_ref)>(GetProcAddress(avutil, "av_frame_move_ref")); if (!p_av_frame_move_ref) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_move_ref"); return -1; }
     p_av_frame_get_buffer = reinterpret_cast<decltype(p_av_frame_get_buffer)>(GetProcAddress(avutil, "av_frame_get_buffer")); if (!p_av_frame_get_buffer) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_get_buffer"); return -1; }
     p_av_frame_make_writable = reinterpret_cast<decltype(p_av_frame_make_writable)>(GetProcAddress(avutil, "av_frame_make_writable")); if (!p_av_frame_make_writable) { snprintf(error, cap, "Missing FFmpeg symbol av_frame_make_writable"); return -1; }
     p_av_hwdevice_ctx_alloc = reinterpret_cast<decltype(p_av_hwdevice_ctx_alloc)>(GetProcAddress(avutil, "av_hwdevice_ctx_alloc")); if (!p_av_hwdevice_ctx_alloc) { snprintf(error, cap, "Missing FFmpeg symbol av_hwdevice_ctx_alloc"); return -1; }
@@ -133,9 +137,9 @@ extern "C" int ps_ff_init(const wchar_t *util, const wchar_t *codec, const wchar
         snprintf(error, cap, "Bundled FFmpeg ABI version mismatch"); return -1;
     }
     p_av_pix_fmt_desc_get = reinterpret_cast<decltype(p_av_pix_fmt_desc_get)>(GetProcAddress(avutil, "av_pix_fmt_desc_get"));
-    if (!p_av_pix_fmt_desc_get) return -1;
+    if (!p_av_pix_fmt_desc_get) { snprintf(error, cap, "Missing FFmpeg symbol av_pix_fmt_desc_get"); return -1; }
     p_av_log_set_callback = reinterpret_cast<decltype(p_av_log_set_callback)>(GetProcAddress(avutil, "av_log_set_callback"));
-    if (!p_av_log_set_callback) return -1;
+    if (!p_av_log_set_callback) { snprintf(error, cap, "Missing FFmpeg symbol av_log_set_callback"); return -1; }
     p_av_log_set_callback(codec_log);
     p_av_log_set_level(AV_LOG_ERROR);
     return 0;
@@ -183,7 +187,9 @@ extern "C" int ps_ff_init(const wchar_t *util, const wchar_t *codec, const wchar
 #define sws_freeContext p_sws_freeContext
 
 static void message(char *error, int cap, const char *where, int result) {
-    char text[160]; av_strerror(result, text, sizeof(text)); snprintf(error, cap, "%s: %s (%d); %s", where, text, result, last_diagnostic);
+    char text[160]; av_strerror(result, text, sizeof(text));
+    snprintf(error, cap, "%s: %s (%d); %s", where, text, result, last_diagnostic);
+    last_diagnostic[0] = 0;
 }
 // A lease keeps a display surface unavailable until the UI has replaced it.
 // Shared ownership also makes decoder teardown/resize safe while a frame is visible.
@@ -200,9 +206,11 @@ struct DisplayConverter {
     int width = 0, height = 0;
 };
 extern "C" void ps_ff_display_release(DisplayLease *lease) {
+    last_diagnostic[0] = 0;
     if (lease) { lease->slot->busy.store(false); delete lease; }
 }
 extern "C" ID3D11Texture2D *ps_ff_display_texture(DisplayLease *lease) {
+    last_diagnostic[0] = 0;
     return lease ? lease->slot->texture.Get() : NULL;
 }
 struct Codec {
@@ -218,6 +226,7 @@ struct Codec {
     DisplayConverter display;
 };
 extern "C" void ps_ff_close(Codec *s) {
+    last_diagnostic[0] = 0;
     if (!s) return;
     avcodec_free_context(&s->ctx); av_frame_free(&s->frame); av_frame_free(&s->download);
     av_packet_free(&s->packet); av_buffer_unref(&s->frames); av_buffer_unref(&s->device);
@@ -231,10 +240,32 @@ static int wrap_device(Codec *s, ID3D11Device *device) {
     device->AddRef(); d3d->device = device;
     return av_hwdevice_ctx_init(s->device);
 }
+static int nvidia_gpu_ordinal(int adapter) {
+    if (adapter < 0) return -1;
+    IDXGIFactory1 *factory = NULL;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) return -1;
+    int ordinal = 0;
+    int matched = -1;
+    for (UINT i = 0; i <= (UINT)adapter; ++i) {
+        IDXGIAdapter1 *cur = NULL;
+        if (FAILED(factory->EnumAdapters1(i, &cur))) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        HRESULT hr = cur->GetDesc1(&desc);
+        cur->Release();
+        if (FAILED(hr)) break;
+        if (desc.VendorId == 0x10DE) {
+            if ((int)i == adapter) { matched = ordinal; break; }
+            ++ordinal;
+        }
+    }
+    factory->Release();
+    return matched;
+}
 extern "C" ID3D11Device *ps_ff_device(int index);
 extern "C" long long ps_ff_device_luid(ID3D11Device *device);
 extern "C" Codec *ps_ff_encoder(const char *name, int width, int height, int fps, int bitrate, int threads,
                                   ID3D11Device *device, int adapter, char *error, int cap) {
+    last_diagnostic[0] = 0;
     const AVCodec *codec = avcodec_find_encoder_by_name(name);
     if (!codec) { snprintf(error, cap, "Encoder not bundled: %s", name); return NULL; }
     Codec *s = new Codec{};
@@ -242,7 +273,10 @@ extern "C" Codec *ps_ff_encoder(const char *name, int width, int height, int fps
     if (!s->ctx || !s->frame || !s->packet) { ps_ff_close(s); return NULL; }
     AVCodecContext *c = s->ctx;
     c->width = width; c->height = height; c->time_base = AVRational{1, 1000000}; c->framerate = AVRational{fps, 1};
-    c->bit_rate = bitrate; c->rc_max_rate = bitrate; c->rc_buffer_size = bitrate / fps * 2;
+    c->bit_rate = bitrate; c->rc_max_rate = bitrate;
+    int64_t vbv_time = (int64_t)bitrate / 4;
+    int64_t vbv_frames = fps > 0 ? ((int64_t)bitrate / fps) * 4 : vbv_time;
+    c->rc_buffer_size = (int)(vbv_time > vbv_frames ? vbv_time : vbv_frames);
     // Preserve existing low-latency levels through 1080p. Larger presets need
     // the encoder to choose a level matching both dimensions and frame rate.
     if (codec->id == AV_CODEC_ID_H264 && (int64_t)width * height <= 1920LL * 1080)
@@ -289,7 +323,11 @@ extern "C" Codec *ps_ff_encoder(const char *name, int width, int height, int fps
         av_opt_set_int(c->priv_data, "zerolatency", 1, 0); av_opt_set_int(c->priv_data, "delay", 0, 0);
         av_opt_set_int(c->priv_data, "forced-idr", 1, 0);
         av_opt_set_int(c->priv_data, "no-scenecut", 1, 0);
-        if (!device) av_opt_set_int(c->priv_data, "gpu", adapter, 0);
+        if (!device) {
+            int cuda_gpu = nvidia_gpu_ordinal(adapter);
+            if (cuda_gpu < 0) { result = AVERROR(ENODEV); goto fail; }
+            av_opt_set_int(c->priv_data, "gpu", cuda_gpu, 0);
+        }
         if (codec->id == AV_CODEC_ID_H264) av_opt_set(c->priv_data, "profile", "baseline", 0);
     } else if (strstr(name, "amf")) {
         av_opt_set(c->priv_data, "usage", "ultralowlatency", 0); av_opt_set(c->priv_data, "quality", "speed", 0);
@@ -331,6 +369,7 @@ fail:
 }
 extern "C" int ps_ff_encode(Codec *s, const unsigned char *bgra, int stride, ID3D11Texture2D *texture,
                               int64_t micros, int keyframe, char *error, int cap) {
+    last_diagnostic[0] = 0;
     int result;
     if (s->gpu_input) {
         if (!texture) return AVERROR(EINVAL);
@@ -356,6 +395,7 @@ extern "C" int ps_ff_encode(Codec *s, const unsigned char *bgra, int stride, ID3
     return result;
 }
 extern "C" int ps_ff_packet(Codec *s, const unsigned char **data, int *size, int64_t *micros, int *keyframe, char *error, int cap) {
+    last_diagnostic[0] = 0;
     av_packet_unref(s->packet); int result = avcodec_receive_packet(s->ctx, s->packet);
     if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return 0;
     if (result < 0) { message(error, cap, "Encode output", result); return result; }
@@ -370,6 +410,7 @@ static AVPixelFormat select_format(AVCodecContext *ctx, const AVPixelFormat *for
     return AV_PIX_FMT_NONE;
 }
 extern "C" Codec *ps_ff_decoder(int hevc, int threads, int hardware, int adapter, ID3D11Device *device, char *error, int cap) {
+    last_diagnostic[0] = 0;
     const AVCodec *codec = avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
     if (!codec) return NULL;
     Codec *s = new Codec{};
@@ -393,6 +434,7 @@ fail:
 // Report the D3D11 device actually retained by FFmpeg after codec opening.
 // QSV uses its explicitly selected child adapter and has no public D3D field here.
 extern "C" long long ps_ff_codec_device_luid(Codec *s) {
+    last_diagnostic[0] = 0;
     if (!s || !s->device) return 0;
     auto hw = (AVHWDeviceContext *)s->device->data;
     if (hw->type != AV_HWDEVICE_TYPE_D3D11VA) return 0;
@@ -400,14 +442,25 @@ extern "C" long long ps_ff_codec_device_luid(Codec *s) {
     return d3d->device ? ps_ff_device_luid(d3d->device) : 0;
 }
 extern "C" void ps_ff_cpu_info(char *out, int cap) {
+    last_diagnostic[0] = 0;
     char name[256] = "Unknown CPU", vendor[96] = "unknown"; HKEY key;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &key) == ERROR_SUCCESS) {
-        DWORD size = sizeof(name)-1; RegQueryValueExA(key, "ProcessorNameString", NULL, NULL, (LPBYTE)name, &size);
-        size = sizeof(vendor)-1; RegQueryValueExA(key, "VendorIdentifier", NULL, NULL, (LPBYTE)vendor, &size); RegCloseKey(key);
+        char tmp_name[256]; DWORD size = sizeof(tmp_name) - 1;
+        if (RegQueryValueExA(key, "ProcessorNameString", NULL, NULL, (LPBYTE)tmp_name, &size) == ERROR_SUCCESS) {
+            tmp_name[size] = 0;
+            memcpy(name, tmp_name, size + 1);
+        }
+        char tmp_vendor[96]; size = sizeof(tmp_vendor) - 1;
+        if (RegQueryValueExA(key, "VendorIdentifier", NULL, NULL, (LPBYTE)tmp_vendor, &size) == ERROR_SUCCESS) {
+            tmp_vendor[size] = 0;
+            memcpy(vendor, tmp_vendor, size + 1);
+        }
+        RegCloseKey(key);
     }
     snprintf(out, cap, "%s; vendor=%s; logical_processors=%lu", name, vendor, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
 }
 extern "C" int ps_ff_decode(Codec *s, const unsigned char *data, int size, char *error, int cap) {
+    last_diagnostic[0] = 0;
     av_packet_unref(s->packet); int result = av_new_packet(s->packet, size);
     if (result < 0) return result;
     memcpy(s->packet->data, data, size);
@@ -488,6 +541,7 @@ static HRESULT display_frame(Codec *s, AVFrame *f, DisplayLease **lease) {
 }
 extern "C" int ps_ff_frame(Codec *s, int *width, int *height, int *hardware,
                             int gpu_output, DisplayLease **lease, char *error, int cap) {
+    last_diagnostic[0] = 0;
     *lease = NULL;
     av_frame_unref(s->frame); int result = avcodec_receive_frame(s->ctx, s->frame);
     if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return 0;
@@ -515,6 +569,7 @@ extern "C" int ps_ff_frame(Codec *s, int *width, int *height, int *hardware,
     return 3; // CPU output needed; keep the received frame for ps_ff_rgba.
 }
 extern "C" int ps_ff_rgba(Codec *s, unsigned char *rgba, int capacity, char *error, int cap) {
+    last_diagnostic[0] = 0;
     AVFrame *f = s->frame;
     int result;
     if (f->format == AV_PIX_FMT_D3D11) {
@@ -531,10 +586,11 @@ extern "C" int ps_ff_rgba(Codec *s, unsigned char *rgba, int capacity, char *err
     if (result < 0) { message(error, cap, "Decode color conversion", result); return result; }
     return 1;
 }
-extern "C" unsigned ps_ff_version(void) { return avcodec_version(); }
+extern "C" unsigned ps_ff_version(void) { last_diagnostic[0] = 0; return avcodec_version(); }
 
 struct GpuInfo { unsigned vendor; unsigned device; unsigned sub_system; unsigned revision; long long luid; long long driver; wchar_t name[128]; };
 extern "C" int ps_ff_gpu(int index, GpuInfo *info) {
+    last_diagnostic[0] = 0;
     IDXGIFactory1 *factory = NULL; IDXGIAdapter1 *adapter = NULL;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) return 0;
     HRESULT result = factory->EnumAdapters1(index, &adapter); factory->Release();
@@ -548,6 +604,7 @@ extern "C" int ps_ff_gpu(int index, GpuInfo *info) {
     return 1;
 }
 extern "C" long long ps_ff_device_luid(ID3D11Device *device) {
+    last_diagnostic[0] = 0;
     IDXGIDevice *dxgi = NULL; IDXGIAdapter *adapter = NULL; DXGI_ADAPTER_DESC desc{};
     if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi))) return 0;
     HRESULT result = dxgi->GetAdapter(&adapter); dxgi->Release();
@@ -557,15 +614,24 @@ extern "C" long long ps_ff_device_luid(ID3D11Device *device) {
     return ((long long)desc.AdapterLuid.HighPart << 32) | desc.AdapterLuid.LowPart;
 }
 extern "C" ID3D11Device *ps_ff_device(int index) {
+    last_diagnostic[0] = 0;
     IDXGIFactory1 *factory = NULL; IDXGIAdapter1 *adapter = NULL;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) return NULL;
     HRESULT result = factory->EnumAdapters1(index, &adapter); factory->Release();
     if (FAILED(result)) return NULL;
     ID3D11Device *device = NULL;
-    result = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL);
+    result = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                               NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL);
+    if (FAILED(result)) {
+        result = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL);
+    }
     adapter->Release(); return SUCCEEDED(result) ? device : NULL;
 }
 extern "C" void ps_ff_drivers(char *out, int cap) {
+    last_diagnostic[0] = 0;
     out[0] = 0; HKEY root;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}", 0, KEY_READ, &root) != ERROR_SUCCESS) return;
     int offset = 0;
@@ -575,8 +641,10 @@ extern "C" void ps_ff_drivers(char *out, int cap) {
         HKEY entry; if (RegOpenKeyExA(root, name, 0, KEY_READ, &entry) != ERROR_SUCCESS) continue;
         for (const char *key : {"MatchingDeviceId", "DriverVersion", "DriverDate"}) {
             char data[256] = {}; DWORD size = sizeof(data) - 1;
-            if (RegQueryValueExA(entry, key, NULL, NULL, (LPBYTE)data, &size) == ERROR_SUCCESS && offset + 300 < cap)
+            if (RegQueryValueExA(entry, key, NULL, NULL, (LPBYTE)data, &size) == ERROR_SUCCESS && offset + 300 < cap) {
+                data[size] = 0;
                 offset += snprintf(out + offset, cap - offset, "%s=%s;", key, data);
+            }
         }
         RegCloseKey(entry);
     }

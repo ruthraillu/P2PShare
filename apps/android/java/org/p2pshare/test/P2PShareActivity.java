@@ -60,7 +60,7 @@ public final class P2PShareActivity extends NativeActivity {
         if(request==95&&(result!=RESULT_OK||data==null)){ScreenShareService.cancelSwitch();return;}
         if(request==95&&result==RESULT_OK&&data!=null){
             try{startForegroundService(new Intent(this,ScreenShareService.class).putExtra("result",result).putExtra("data",data));}
-            catch(Exception e){ScreenShareService.nativeSharing(false,0,0,e.toString());}
+            catch(Exception e){ScreenShareService.cancelSwitch();ScreenShareService.nativeSharing(false,0,0,e.toString());}
         }
     }
     public static native void nativeAvatarPicked(byte[] data);
@@ -74,20 +74,31 @@ public final class P2PShareActivity extends NativeActivity {
     private volatile boolean pipAvailable;
     private boolean pipSession;
     private volatile int pipWidth=16,pipHeight=9;
+    private volatile boolean keepScreenOn;
     public static native void nativePipMode(boolean active);
     public static native void nativePipClosed();
-    @Override public void onStart(){super.onStart();nativeForeground(true);}
-    @Override public void onResume(){super.onResume();if(!isInPictureInPictureMode())pipSession=false;nativeForeground(true);}
+    @Override public void onStart(){super.onStart();VideoDecoder.setForeground(true);nativeForeground(true);}
+    @Override public void onResume(){super.onResume();if(!isInPictureInPictureMode())pipSession=false;VideoDecoder.setForeground(true);nativeForeground(true);}
     @Override public void onPause(){super.onPause();}
     @Override public void onStop(){
-        super.onStop();nativeForeground(false);
+        super.onStop();VideoDecoder.setForeground(false);nativeForeground(false);
         if(pipSession || isInPictureInPictureMode()){pipSession=false;nativePipClosed();}
     }
-    public void updatePip(boolean available,int width,int height){
-        if(pipAvailable==available && pipWidth==width && pipHeight==height)return;
+    public void setKeepScreenOn(boolean on){
+        if(keepScreenOn==on)return;
         runOnUiThread(()->{
-        if(pipAvailable==available && pipWidth==width && pipHeight==height)return;
-        pipAvailable=available;pipWidth=Math.max(1,width);pipHeight=Math.max(1,height);
+            if(keepScreenOn==on)return;
+            keepScreenOn=on;
+            if(on)getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        });
+    }
+    public void updatePip(boolean available,int width,int height){
+        int w=Math.max(1,width),h=Math.max(1,height);
+        if(pipAvailable==available && pipWidth==w && pipHeight==h)return;
+        runOnUiThread(()->{
+        if(pipAvailable==available && pipWidth==w && pipHeight==h)return;
+        pipAvailable=available;pipWidth=w;pipHeight=h;
         if(getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)){
             try{setPictureInPictureParams(pipParams());}catch(RuntimeException e){DebugLog.record("pip_params_error="+e);}
         }
@@ -148,7 +159,6 @@ public final class P2PShareActivity extends NativeActivity {
         super.onCreate(state);
         L10n.init(this);
         setVolumeControlStream(android.media.AudioManager.STREAM_MUSIC);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if(Build.VERSION.SDK_INT>=30) getWindow().setDecorFitsSystemWindows(false);
         else getWindow().getDecorView().setSystemUiVisibility(android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE | android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         if(Build.VERSION.SDK_INT>=28) {
@@ -228,6 +238,7 @@ public final class P2PShareActivity extends NativeActivity {
     public String decoderDiagnostics() { return VideoDecoder.diagnostics(); }
     public void removeDecoder(String peer) { VideoDecoder.remove(peer); }
     @Override public void onDestroy() {
+        audioPlayback.close();
         if(Build.VERSION.SDK_INT>=33 && backCallback!=null) {getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);backCallback=null;}
         super.onDestroy();
     }

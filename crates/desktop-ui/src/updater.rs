@@ -184,7 +184,7 @@ fn client() -> Result<Client> {
         .https_only(true)
         .user_agent(concat!("P2PShare/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .read_timeout(Duration::from_secs(30))
         .build()?)
 }
 
@@ -203,6 +203,7 @@ async fn bounded_body(mut response: reqwest::Response, limit: u64) -> Result<Vec
 async fn check() -> Result<Option<Release>> {
     let response = client()?
         .get(API)
+        .timeout(Duration::from_secs(30))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?;
@@ -259,19 +260,69 @@ fn clean_stage(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
+fn parse_stage_name(name: &str) -> Option<(u32, u128)> {
+    let (pid, stamp) = name.strip_prefix("stage-")?.split_once('-')?;
+    Some((pid.parse().ok()?, stamp.parse().ok()?))
+}
+
 fn stage_name(name: &str) -> bool {
-    name.strip_prefix("stage-")
-        .and_then(|value| value.split_once('-'))
-        .is_some_and(|(pid, stamp)| pid.parse::<u32>().is_ok() && stamp.parse::<u128>().is_ok())
+    parse_stage_name(name).is_some()
+}
+
+fn paths_eq_ci(a: &Path, b: &Path) -> bool {
+    let a = crate::firewall::strip_verbatim_prefix(a);
+    let b = crate::firewall::strip_verbatim_prefix(b);
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (Some(x), Some(y)) => {
+                let xs = x.as_os_str().to_string_lossy();
+                let ys = y.as_os_str().to_string_lossy();
+                if !xs.eq_ignore_ascii_case(&ys) && xs.to_lowercase() != ys.to_lowercase() {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+pub(super) fn same_canonical_path(path: &Path) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_attributes() & 0x400 != 0 {
+        return Ok(false);
+    }
+    Ok(paths_eq_ci(&path.canonicalize()?, path))
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut code = 0u32;
+                let running =
+                    GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+                let _ = CloseHandle(handle);
+                running
+            }
+            Err(error) if error.code().0 as u32 == 0x80070057 => false,
+            Err(_) => true,
+        }
+    }
 }
 
 fn update_root(data: &Path) -> Result<PathBuf> {
     let updates = data.join("updates");
     fs::create_dir_all(&updates)?;
-    ensure!(
-        updates.canonicalize()? == updates,
-        "Invalid update directory"
-    );
+    ensure!(same_canonical_path(&updates)?, "Invalid update directory");
     Ok(updates)
 }
 
@@ -284,24 +335,57 @@ fn stage(data: &Path) -> Result<Stage> {
 }
 
 fn cleanup_finished(data: &Path) {
+    #[derive(Deserialize)]
+    struct TransactionRef {
+        stage: String,
+    }
     let updates = data.join("updates");
-    if updates
-        .canonicalize()
-        .ok()
-        .as_deref()
-        .and_then(Path::parent)
-        != Some(data)
+    if !same_canonical_path(&updates).unwrap_or(false)
+        || updates
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .is_none_or(|parent| !paths_eq_ci(&parent, data))
     {
         return;
     }
+    let tx_path = updates.join("transaction.json");
+    let (allow_orphans, active_stage) = if tx_path.exists() {
+        match fs::read(&tx_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TransactionRef>(&bytes).ok())
+        {
+            Some(tx) => (true, Some(tx.stage)),
+            None => (false, None),
+        }
+    } else {
+        (true, None)
+    };
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let orphan_age = Duration::from_secs(10 * 60).as_nanos();
     let Ok(entries) = fs::read_dir(&updates) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if stage_name(&entry.file_name().to_string_lossy())
-            && path.canonicalize().ok().as_deref() == Some(path.as_path())
-            && path.join("installed").is_file()
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some((pid, stamp)) = parse_stage_name(&name) else {
+            continue;
+        };
+        if !same_canonical_path(&path).unwrap_or(false) {
+            continue;
+        }
+        if path.join("installed").is_file() {
+            clean_stage(&path);
+        } else if allow_orphans
+            && active_stage.as_deref() != Some(name.as_ref())
+            && pid != std::process::id()
+            && now_nanos.saturating_sub(stamp) >= orphan_age
+            && !is_pid_running(pid)
         {
             clean_stage(&path);
         }
@@ -314,6 +398,7 @@ async fn download(payload: Payload, data: &Path, tx: &Sender<Event>) -> Result<S
     let url = format!("{RELEASES}/v{}", payload.version);
     let response = client
         .get(format!("{url}/{SIG}"))
+        .timeout(Duration::from_secs(30))
         .send()
         .await?
         .error_for_status()?;
@@ -512,21 +597,30 @@ pub fn recover_pending_update(data: &Path) -> Result<()> {
 }
 
 fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let raw_exe = std::env::current_exe()?;
+    let exe = raw_exe.canonicalize()?;
     let stage = exe.parent().context("Installer directory unavailable")?;
     let updates = stage.parent().context("Update directory unavailable")?;
     let data = updates.parent().context("Data directory unavailable")?;
     let home = data
         .parent()
         .context("Installation directory unavailable")?;
+    let name_eq_ci = |p: &Path, expected: &str| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(expected))
+    };
     ensure!(
-        updates.ends_with("updates")
-            && data.ends_with("data")
+        same_canonical_path(stage)?
+            && same_canonical_path(updates)?
+            && same_canonical_path(data)?
+            && name_eq_ci(updates, "updates")
+            && name_eq_ci(data, "data")
             && stage
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(stage_name)
-            && exe.ends_with("installer.exe"),
+            && name_eq_ci(&exe, "installer.exe"),
         "Unexpected installer path"
     );
     let name = Path::new(filename);
@@ -573,8 +667,11 @@ fn apply(pid: u32, filename: &std::ffi::OsStr) -> Result<()> {
     let filename = filename
         .to_str()
         .context("Executable name is not Unicode")?;
+    let home_launch = crate::firewall::strip_verbatim_prefix(home);
     bundle::install(home, data, stage, filename, |path| {
-        Command::new(path).current_dir(home).spawn()?;
+        Command::new(crate::firewall::strip_verbatim_prefix(path))
+            .current_dir(&home_launch)
+            .spawn()?;
         Ok(())
     })
 }

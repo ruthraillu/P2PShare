@@ -33,11 +33,12 @@ impl AudioReceiver {
                         return;
                     }
                 };
-                let mut mixer = Mixer::new(if session.playback_delay_ms() > 0 {
+                let mut mixer_buffer_ms = if session.playback_delay_ms() > 0 {
                     0
                 } else {
                     config.playback_buffer_ms
-                });
+                };
+                let mut mixer = Mixer::new(mixer_buffer_ms);
                 let mut report = Instant::now();
                 let mut membership = Instant::now() - Duration::from_secs(1);
                 let mut peers = HashSet::new();
@@ -49,11 +50,29 @@ impl AudioReceiver {
                 while !stopped.load(Ordering::Acquire) {
                     if membership.elapsed() >= Duration::from_millis(20) {
                         membership = Instant::now();
+                        let desired_buffer_ms = if session.playback_delay_ms() > 0 {
+                            0
+                        } else {
+                            config.playback_buffer_ms
+                        };
+                        if desired_buffer_ms != mixer_buffer_ms {
+                            let stats = mixer.stats;
+                            mixer_buffer_ms = desired_buffer_ms;
+                            mixer = Mixer::new(mixer_buffer_ms);
+                            mixer.stats = stats;
+                            pending.clear();
+                            cursor = 0;
+                        }
                         let state = session.snapshot();
                         peers = state
                             .members
                             .iter()
-                            .filter(|m| state.in_room && m.id != state.local_id && m.sharing)
+                            .filter(|m| {
+                                state.in_room
+                                    && m.id != state.local_id
+                                    && m.sharing
+                                    && session.is_watching(&m.id)
+                            })
                             .map(|m| m.id.clone())
                             .collect();
                         mixer.retain(&peers);
@@ -71,7 +90,7 @@ impl AudioReceiver {
                             bridge.close_audio();
                             open = false;
                         }
-                        std::thread::sleep(Duration::from_millis(20));
+                        std::thread::sleep(Duration::from_millis(25));
                         continue;
                     }
                     for packet in session.take_audio() {
@@ -147,13 +166,16 @@ impl AudioReceiver {
             thread: Some(thread),
         })
     }
-}
-impl Drop for AudioReceiver {
-    fn drop(&mut self) {
+    pub(super) fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+impl Drop for AudioReceiver {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 impl Bridge {
@@ -178,7 +200,7 @@ impl Bridge {
         })
         .unwrap_or(-1)
     }
-    fn close_audio(&self) {
+    pub(super) fn close_audio(&self) {
         let _ = self.env(|env| {
             env.call_method(self.activity.as_obj(), "closeAudio", "()V", &[])?;
             Ok(())

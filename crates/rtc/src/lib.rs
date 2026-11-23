@@ -36,6 +36,7 @@ pub struct Drain {
 }
 pub struct PeerRtc {
     rtc: Rtc,
+    peer_label: Option<String>,
     pending: Option<SdpPendingOffer>,
     mid: Option<Mid>,
     audio_mid: Option<Mid>,
@@ -92,6 +93,7 @@ impl PeerRtc {
         }
         Ok(Self {
             rtc,
+            peer_label: None,
             pending: None,
             mid: None,
             audio_mid: None,
@@ -103,6 +105,26 @@ impl PeerRtc {
             selected_path: None,
             control_channel: None,
         })
+    }
+    /// Associates a peer identifier with this transport for diagnostic logs.
+    pub fn set_peer_label(&mut self, label: String) {
+        self.peer_label = Some(label);
+    }
+    fn peer_id(&self) -> &str {
+        self.peer_label.as_deref().unwrap_or("unknown")
+    }
+    pub fn has_control_channel(&self) -> bool {
+        self.control_channel.is_some()
+    }
+    pub fn supports_codec(&mut self, codec: VideoFormat) -> bool {
+        let Some(writer) = self.mid.and_then(|mid| self.rtc.writer(mid)) else {
+            return true;
+        };
+        let expected = match codec {
+            VideoFormat::H264 => str0m::format::Codec::H264,
+            VideoFormat::Hevc => str0m::format::Codec::H265,
+        };
+        writer.payload_params().any(|p| p.spec().codec == expected)
     }
     /// Trickle candidates into the current ICE session; the caller immediately drains.
     pub fn add_local_candidate(&mut self, candidate: &Candidate) {
@@ -116,6 +138,14 @@ impl PeerRtc {
             .map(|p| if p.1.is_ipv6() { "IPv6" } else { "IPv4" })
     }
     pub fn send_control(&mut self, bytes: &[u8]) -> Result<bool> {
+        self.send_control_inner(bytes, false)
+    }
+    /// Sends small/state-critical control messages without letting buffered bulk
+    /// previews or avatars (capped at 64 KB) silently drop them.
+    pub fn send_control_priority(&mut self, bytes: &[u8]) -> Result<bool> {
+        self.send_control_inner(bytes, true)
+    }
+    fn send_control_inner(&mut self, bytes: &[u8], priority: bool) -> Result<bool> {
         anyhow::ensure!(bytes.len() <= 49153, "Control message too large");
         let Some(id) = self.control_channel else {
             return Ok(false);
@@ -123,7 +153,22 @@ impl PeerRtc {
         let Some(mut channel) = self.rtc.channel(id) else {
             return Ok(false);
         };
-        if channel.buffered_amount() > 65536 {
+        let buffered = channel.buffered_amount();
+        let cap = if priority || bytes.len() < 4096 {
+            256 * 1024
+        } else {
+            65536
+        };
+        if buffered > cap {
+            drop(channel);
+            tracing::warn!(
+                peer = self.peer_id(),
+                bytes = bytes.len(),
+                buffered,
+                cap,
+                priority,
+                "control_message_dropped_sctp_backpressure"
+            );
             return Ok(false);
         }
         Ok(channel.write(true, bytes)?)
@@ -291,6 +336,7 @@ impl PeerRtc {
                     Event::MediaData(m) if m.data.len() <= 2 * 1024 * 1024 => {
                         if !self.first_frame_reported || !m.contiguous {
                             tracing::debug!(
+                                peer = self.peer_id(),
                                 bytes = m.data.len(),
                                 keyframe = m.is_keyframe(),
                                 contiguous = m.contiguous,
@@ -319,11 +365,18 @@ impl PeerRtc {
                             let path = (pair.local.addr, pair.remote.addr);
                             if self.selected_path != Some(path) {
                                 self.selected_path = Some(path);
-                                tracing::info!(local=%path.0, remote=%path.1, ip_version=if path.1.is_ipv6() { "IPv6" } else { "IPv4" }, "media_path_selected");
+                                tracing::info!(
+                                    peer = self.peer_id(),
+                                    local = %path.0,
+                                    remote = %path.1,
+                                    ip_version = if path.1.is_ipv6() { "IPv6" } else { "IPv4" },
+                                    "media_path_selected"
+                                );
                             }
                         }
                         if p2pshare_media::diagnostics::enabled() {
                             tracing::info!(
+                                peer = self.peer_id(),
                                 ip_version = self
                                     .selected_path
                                     .map(|p| if p.1.is_ipv6() { "IPv6" } else { "IPv4" })
@@ -346,6 +399,7 @@ impl PeerRtc {
                     Event::MediaIngressStats(s) => {
                         if p2pshare_media::diagnostics::enabled() {
                             tracing::info!(
+                                peer = self.peer_id(),
                                 bytes = s.bytes,
                                 packets = s.packets,
                                 nacks = s.nacks,
@@ -370,6 +424,7 @@ impl PeerRtc {
                     Event::MediaEgressStats(s) => {
                         if p2pshare_media::diagnostics::enabled() {
                             tracing::info!(
+                                peer = self.peer_id(),
                                 bytes = s.bytes,
                                 packets = s.packets,
                                 nacks = s.nacks,
@@ -397,11 +452,11 @@ impl PeerRtc {
                         }
                     }
                     Event::KeyframeRequest(_) => {
-                        tracing::info!("keyframe_requested_by_receiver");
+                        tracing::info!(peer = self.peer_id(), "keyframe_requested_by_receiver");
                         out.events.push(RtcEvent::Keyframe);
                     }
                     Event::IceConnectionStateChange(state) => {
-                        tracing::info!(?state, "media_ice_state");
+                        tracing::info!(peer = self.peer_id(), ?state, "media_ice_state");
                         match state {
                             str0m::IceConnectionState::Connected
                             | str0m::IceConnectionState::Completed

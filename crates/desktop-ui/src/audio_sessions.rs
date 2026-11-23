@@ -69,6 +69,7 @@ pub fn active_audio_pids() -> anyhow::Result<BTreeSet<u32>> {
             *mut *mut c_void,
         ) -> HRESULT = std::mem::transmute(enumerator.vtable().EnumAudioEndpoints);
         enumerate(enumerator.as_raw(), eRender, 1, &mut raw).ok()?;
+        anyhow::ensure!(!raw.is_null(), "Null audio endpoint collection");
         let devices = Collection::from_raw(raw);
         let mut count = 0;
         (devices.vtable().count)(devices.as_raw(), &mut count).ok()?;
@@ -76,28 +77,73 @@ pub fn active_audio_pids() -> anyhow::Result<BTreeSet<u32>> {
         let mut pids = BTreeSet::new();
         for index in 0..count {
             let mut raw = std::ptr::null_mut();
-            (devices.vtable().item)(devices.as_raw(), index, &mut raw).ok()?;
+            if let Err(error) = (devices.vtable().item)(devices.as_raw(), index, &mut raw).ok() {
+                tracing::debug!(index, %error, "audio_endpoint_item_skipped");
+                continue;
+            }
+            if raw.is_null() {
+                tracing::debug!(index, "audio_endpoint_null_skipped");
+                continue;
+            }
             let device = IMMDevice::from_raw(raw);
-            let manager: Manager = device.Activate(CLSCTX_ALL, None)?;
+            let manager: Manager = match device.Activate(CLSCTX_ALL, None) {
+                Ok(manager) => manager,
+                Err(error) => {
+                    tracing::debug!(index, %error, "audio_endpoint_activate_skipped");
+                    continue;
+                }
+            };
             let mut raw = std::ptr::null_mut();
-            (manager.vtable().sessions)(manager.as_raw(), &mut raw).ok()?;
+            if let Err(error) = (manager.vtable().sessions)(manager.as_raw(), &mut raw).ok() {
+                tracing::debug!(index, %error, "audio_endpoint_sessions_skipped");
+                continue;
+            }
+            if raw.is_null() {
+                tracing::debug!(index, "audio_endpoint_sessions_null_skipped");
+                continue;
+            }
             let sessions = Sessions::from_raw(raw);
             let mut n = 0;
-            (sessions.vtable().count)(sessions.as_raw(), &mut n).ok()?;
-            anyhow::ensure!((0..=512).contains(&n), "Too many audio sessions");
+            if let Err(error) = (sessions.vtable().count)(sessions.as_raw(), &mut n).ok() {
+                tracing::debug!(index, %error, "audio_endpoint_session_count_skipped");
+                continue;
+            }
+            if !(0..=512).contains(&n) {
+                tracing::debug!(index, count = n, "audio_endpoint_session_count_out_of_range");
+                continue;
+            }
             for i in 0..n {
                 let mut raw = std::ptr::null_mut();
-                (sessions.vtable().item)(sessions.as_raw(), i, &mut raw).ok()?;
+                if let Err(error) = (sessions.vtable().item)(sessions.as_raw(), i, &mut raw).ok() {
+                    tracing::debug!(index, session = i, %error, "audio_session_item_skipped");
+                    continue;
+                }
+                if raw.is_null() {
+                    tracing::debug!(index, session = i, "audio_session_null_skipped");
+                    continue;
+                }
                 let unknown = windows_core::IUnknown::from_raw(raw);
-                let control: Control = unknown.cast()?;
+                let control: Control = match unknown.cast() {
+                    Ok(control) => control,
+                    Err(error) => {
+                        tracing::debug!(index, session = i, %error, "audio_session_cast_skipped");
+                        continue;
+                    }
+                };
                 let mut state = 0;
-                (control.vtable().state)(control.as_raw(), &mut state).ok()?;
+                if let Err(error) = (control.vtable().state)(control.as_raw(), &mut state).ok() {
+                    tracing::debug!(index, session = i, %error, "audio_session_state_skipped");
+                    continue;
+                }
                 if state != 1 {
                     continue;
                 }
                 let mut pid = 0;
                 let hr = (control.vtable().pid)(control.as_raw(), &mut pid);
-                hr.ok()?;
+                if let Err(error) = hr.ok() {
+                    tracing::debug!(index, session = i, %error, "audio_session_pid_skipped");
+                    continue;
+                }
                 if hr.0 == 0 && pid != 0 {
                     pids.insert(pid);
                 }

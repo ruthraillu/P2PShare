@@ -38,9 +38,18 @@ final class AudioPlayback {
             if(!focus) {if(track.getPlayState()==AudioTrack.PLAYSTATE_PLAYING){track.pause();track.flush();written=0;lastHead=0;headWrap=0;}return 0;}
             if(track.getPlayState()!=AudioTrack.PLAYSTATE_PLAYING) track.play();
             long head=Integer.toUnsignedLong(track.getPlaybackHeadPosition());
-            if(head<lastHead) headWrap+=1L<<32;
+            if(head<lastHead) {
+                if((lastHead-head)>(1L<<31)) {
+                    headWrap+=1L<<32;
+                } else {
+                    headWrap=0;
+                    written=head;
+                }
+            }
             lastHead=head;
-            queued=Math.max(0,written-head-headWrap);
+            long played=head+headWrap;
+            if(written<played) written=played;
+            queued=written-played;
             int current=track.getUnderrunCount();
             underruns+=Math.max(0,current-previousUnderruns);previousUnderruns=current;
             // Only queue 10–20 ms even if the driver allocates a larger buffer.

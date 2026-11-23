@@ -10,10 +10,12 @@ use std::{
     sync::mpsc,
 };
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
-use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 const HELPER: &str = "--configure-firewall";
 const CHECK: &str = "--firewall-status";
 const POLICY_BLOCKED: u8 = 2;
+const WAIT_TIMEOUT_MS: u32 = 45_000;
+const WAIT_TIMEOUT_CODE: u32 = 0x0000_0102;
 const SCRIPT: &str = include_str!("firewall.ps1");
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Status {
@@ -27,14 +29,59 @@ struct Preference {
     executable: PathBuf,
     dismissed: bool,
 }
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(r"UNC\") {
+            PathBuf::from(format!(r"\\{}", &rest[4..]))
+        } else {
+            PathBuf::from(rest)
+        }
+    } else {
+        path.to_path_buf()
+    }
+}
+fn diagnostic_path(program: &Path) -> Option<PathBuf> {
+    program
+        .parent()
+        .map(|home| home.join("data/firewall/last-helper-error.txt"))
+}
+fn write_helper_diagnostic(program: &Path, message: &str) {
+    if let Some(path) = diagnostic_path(program) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let truncated: String = message.chars().take(4000).collect();
+        let _ = std::fs::write(path, truncated);
+    }
+}
+fn clear_helper_diagnostic(program: &Path) {
+    if let Some(path) = diagnostic_path(program) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+fn take_helper_diagnostic(program: &Path) -> Option<String> {
+    let path = diagnostic_path(program)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(2000).collect())
+    }
+}
 fn script(program: &Path, apply: bool) -> Result<String> {
-    let program = program
+    let normalized = strip_verbatim_prefix(program);
+    let program = normalized
         .to_str()
         .context("Firewall setup requires a Unicode executable path")?;
     anyhow::ensure!(!program.contains('\0'), "Invalid executable path");
+    let encoded_program = STANDARD.encode(program.as_bytes());
     Ok(format!(
-        "Import-Module -Name (Join-Path $PSHOME 'Modules/NetSecurity/NetSecurity.psd1') -ErrorAction Stop\n{SCRIPT}\nInvoke-P2PFirewall -Program '{}' -Apply ${apply}",
-        program.replace('\'', "''")
+        "Import-Module -Name (Join-Path $PSHOME 'Modules/NetSecurity/NetSecurity.psd1') -ErrorAction Stop\n{SCRIPT}\n$p2pProgram=[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_program}'))\nInvoke-P2PFirewall -Program $p2pProgram -Apply ${apply}"
     ))
 }
 fn encoded(script: &str) -> String {
@@ -62,6 +109,7 @@ fn powershell() -> Result<PathBuf> {
         .join("WindowsPowerShell/v1.0/powershell.exe"))
 }
 fn invoke(program: &Path, apply: bool) -> Result<Status> {
+    let program = strip_verbatim_prefix(program);
     let home = program.parent().context("Missing application directory")?;
     let cache = home.join("data/firewall");
     std::fs::create_dir_all(&cache)?;
@@ -70,14 +118,14 @@ fn invoke(program: &Path, apply: bool) -> Result<Status> {
         .parent()
         .context("Missing Windows PowerShell directory")?
         .join("Modules");
-    let output = Command::new(&shell)
+    let mut child = Command::new(&shell)
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
         ])
-        .arg(encoded(&script(program, apply)?))
+        .arg(encoded(&script(&program, apply)?))
         .current_dir(home)
         .creation_flags(0x08000000)
         .env("TEMP", &cache)
@@ -85,17 +133,52 @@ fn invoke(program: &Path, apply: bool) -> Result<Status> {
         .env("PSModuleAnalysisCachePath", cache.join("module-cache"))
         .env("PSModulePath", modules)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("Could not start Windows firewall setup")?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        }
+        buf
+    });
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(WAIT_TIMEOUT_MS));
+    let exit_status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            bail!("Windows firewall command timed out after 45 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
     anyhow::ensure!(
-        output.status.success(),
+        exit_status.success(),
         "Windows firewall command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr)
             .chars()
             .take(1200)
             .collect::<String>()
     );
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
     let line = text
         .lines()
         .rev()
@@ -109,20 +192,38 @@ pub fn command_mode() -> Option<std::process::ExitCode> {
     if args.len() != 2 || (args[1] != HELPER && args[1] != CHECK) {
         return None;
     }
-    let result = std::env::current_exe()
-        .map_err(anyhow::Error::from)
-        .and_then(|program| invoke(&program, args[1] == HELPER));
+    let applying = args[1] == HELPER;
+    let exe = std::env::current_exe().map(|p| strip_verbatim_prefix(&p));
+    let result = exe
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .and_then(|program| invoke(program, applying));
     Some(match result {
-        Ok(status) if args[1] == CHECK => {
+        Ok(status) if !applying => {
             println!("{}", serde_json::to_string(&status).unwrap());
             std::process::ExitCode::SUCCESS
         }
-        Ok(status) if status.configured => std::process::ExitCode::SUCCESS,
+        Ok(status) if status.configured => {
+            if let Ok(program) = &exe {
+                clear_helper_diagnostic(program);
+            }
+            std::process::ExitCode::SUCCESS
+        }
         Ok(status) => {
+            let message = format!(
+                "Firewall policy still blocks UDP (app_udp_blocks={}, restricted_profiles={})",
+                status.app_udp_blocks, status.restricted_profiles
+            );
+            if let Ok(program) = &exe {
+                write_helper_diagnostic(program, &message);
+            }
             eprintln!("Firewall policy still blocks UDP: {status:?}");
             std::process::ExitCode::from(POLICY_BLOCKED)
         }
         Err(error) => {
+            if applying && let Ok(program) = &exe {
+                write_helper_diagnostic(program, &format!("{error:#}"));
+            }
             eprintln!("Firewall setup failed: {error:#}");
             std::process::ExitCode::FAILURE
         }
@@ -154,6 +255,7 @@ fn elevate(program: &Path, hwnd: usize) -> Result<u32> {
         fn ShellExecuteExW(info: *mut ExecuteInfo) -> i32;
     }
     use std::os::windows::ffi::OsStrExt;
+    let program = strip_verbatim_prefix(program);
     let file: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
     let parameters: Vec<u16> = HELPER.encode_utf16().chain(Some(0)).collect();
@@ -205,7 +307,10 @@ fn elevate(program: &Path, hwnd: usize) -> Result<u32> {
             }
         }
         let _handle = Owned(handle);
-        let wait = WaitForSingleObject(handle, INFINITE);
+        let wait = WaitForSingleObject(handle, WAIT_TIMEOUT_MS);
+        if wait.0 == WAIT_TIMEOUT_CODE {
+            bail!("Windows firewall setup timed out after 45 seconds");
+        }
         anyhow::ensure!(wait.0 == 0, "Waiting for firewall setup failed");
         let mut code = 1;
         GetExitCodeProcess(handle, &mut code)?;
@@ -214,29 +319,46 @@ fn elevate(program: &Path, hwnd: usize) -> Result<u32> {
 }
 
 fn apply_and_check(program: &Path, hwnd: usize) -> Result<Status> {
-    let code = elevate(program, hwnd)?;
+    let program = strip_verbatim_prefix(program);
+    clear_helper_diagnostic(&program);
+    let code = elevate(&program, hwnd)?;
     // A successful elevated result already verified ActiveStore. An unelevated
     // process may lack permission to read that store on some Windows setups.
     if code == 0 {
+        clear_helper_diagnostic(&program);
         return Ok(Status {
             configured: true,
             ..Status::default()
         });
     }
+    let diagnostic = take_helper_diagnostic(&program);
     let reason = if code == u32::from(POLICY_BLOCKED) {
         "Windows did not confirm the firewall rule.".to_owned()
     } else {
         format!("The Windows firewall helper failed (exit code {code}).")
     };
-    match invoke(program, false) {
+    let detail = diagnostic
+        .as_deref()
+        .map(|text| format!(" Helper details: {text}"))
+        .unwrap_or_default();
+    match invoke(&program, false) {
         Ok(status) if status.configured => Ok(status),
         Ok(status) => bail!(
-            "{reason} Active inbound UDP blocks for this app: {}. Network profiles that reject inbound allow rules: {}.",
+            "{reason}{detail} Active inbound UDP blocks for this app: {}. Network profiles that reject inbound allow rules: {}.",
             status.app_udp_blocks,
             status.restricted_profiles
         ),
-        Err(error) => bail!("{reason} Firewall status check failed: {error:#}"),
+        Err(error) => bail!("{reason}{detail} Firewall status check failed: {error:#}"),
     }
+}
+
+fn is_access_denied_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("access denied")
+        || lower.contains("permissiondenied")
+        || lower.contains("unauthorizedaccess")
+        || lower.contains("0x80070005")
 }
 
 pub(super) struct Firewall {
@@ -247,11 +369,13 @@ pub(super) struct Firewall {
     error: Option<String>,
     open: bool,
     automatic: bool,
+    checking_automatic: bool,
     busy: bool,
     applying: bool,
 }
 impl Firewall {
     pub fn new(program: PathBuf, enabled: bool) -> Self {
+        let program = strip_verbatim_prefix(&program);
         let preference = program
             .parent()
             .unwrap_or(Path::new("."))
@@ -259,7 +383,7 @@ impl Firewall {
         let dismissed = std::fs::read_to_string(&preference)
             .ok()
             .and_then(|text| toml::from_str::<Preference>(&text).ok())
-            .is_some_and(|p| p.executable == program && p.dismissed);
+            .is_some_and(|p| strip_verbatim_prefix(&p.executable) == program && p.dismissed);
         let mut this = Self {
             program,
             preference,
@@ -268,13 +392,18 @@ impl Firewall {
             error: None,
             open: false,
             automatic: enabled && !dismissed,
+            checking_automatic: false,
             busy: false,
             applying: false,
         };
         if this.automatic {
+            this.checking_automatic = true;
             this.check();
         }
         this
+    }
+    pub fn is_open(&self) -> bool {
+        self.open
     }
     fn check(&mut self) {
         let program = self.program.clone();
@@ -288,6 +417,7 @@ impl Firewall {
     pub fn request(&mut self) {
         self.open = true;
         self.automatic = false;
+        self.checking_automatic = false;
         if !self.busy {
             self.check();
         }
@@ -310,7 +440,8 @@ impl Firewall {
         }
     }
     fn allow(&mut self, hwnd: usize) {
-        self.stop_startup_prompt();
+        self.automatic = false;
+        self.checking_automatic = false;
         let program = self.program.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
@@ -335,18 +466,27 @@ impl Firewall {
             self.receiver = None;
             self.busy = false;
             let applying = std::mem::take(&mut self.applying);
+            let automatic_check = std::mem::take(&mut self.checking_automatic);
             match result {
                 Ok(status) => {
                     tracing::info!(program=%self.program.display(),configured=status.configured,udp_blocks=status.app_udp_blocks,restricted_profiles=status.restricted_profiles,rule=%status.rule,"firewall_status");
                     self.error = None;
                     if applying && status.configured {
                         self.open = false;
+                        self.stop_startup_prompt();
                     }
                     self.status = Some(status);
                 }
                 Err(error) => {
                     tracing::warn!(%error,"firewall_setup_failed");
-                    self.error = Some(error);
+                    if automatic_check && !self.open && is_access_denied_error(&error) {
+                        // Do not pop a red startup error modal when an unelevated
+                        // policy query is denied by local Windows permissions.
+                        self.automatic = false;
+                        self.error = None;
+                    } else {
+                        self.error = Some(error);
+                    }
                 }
             }
         }
@@ -402,11 +542,11 @@ impl Firewall {
             } else if self.busy {
                 ui.label("Checking Windows Firewall…");
             } else if configured {
-                ui.label("P2PShare is allowed to receive peer media on Private and Public networks.");
+                ui.label("P2PShare is allowed to receive peer media on Domain, Private and Public networks.");
             } else {
                 ui.label("Allow incoming peer connections so friends can send video, audio and previews to this app.");
                 ui.add_space(8.);
-                ui.label("Windows will ask for administrator permission. Setup allows UDP for this EXE on Private and Public networks and removes conflicting local inbound UDP blocks for it.");
+                ui.label("Windows will ask for administrator permission. Setup allows UDP for this EXE on Domain, Private and Public networks and removes conflicting local inbound UDP blocks for it.");
             }
             ui.add_space(8.);
             let path=self.program.display().to_string();
@@ -433,7 +573,9 @@ impl Firewall {
         }
         if dismiss {
             self.open = false;
-            self.stop_startup_prompt();
+            if !self.busy {
+                self.stop_startup_prompt();
+            }
         }
     }
 }
@@ -444,9 +586,12 @@ mod tests {
     fn shell_abi_and_utf16_command_preserve_hostile_literal_paths() {
         assert_eq!(std::mem::size_of::<ExecuteInfo>(), 112);
         assert_eq!(std::mem::offset_of!(ExecuteInfo, process), 104);
-        let path = Path::new("F:\\friends' [$x]; `echo bad`\\P2PShare.exe");
+        let path = Path::new("\\\\?\\F:\\friends'\u{2019} [$x]; `echo bad`\\P2PShare.exe");
         let command = script(path, false).unwrap();
-        assert!(command.contains("friends'' [$x]; `echo bad`"));
+        let expected_path = "F:\\friends'\u{2019} [$x]; `echo bad`\\P2PShare.exe";
+        let expected_b64 = STANDARD.encode(expected_path.as_bytes());
+        assert!(command.contains(&format!("FromBase64String('{expected_b64}')")));
+        assert!(!command.contains("`echo bad`"));
         assert!(command.ends_with("-Apply $false"));
         let bytes = STANDARD.decode(encoded(&command)).unwrap();
         let utf16: Vec<_> = bytes
@@ -454,6 +599,10 @@ mod tests {
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(String::from_utf16(&utf16).unwrap(), command);
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\P2PShare.exe")),
+            PathBuf::from(r"\\server\share\P2PShare.exe")
+        );
     }
     #[test]
     fn dismissed_choice_is_scoped_to_executable_location() {
@@ -502,6 +651,7 @@ mod tests {
             error: None,
             open: true,
             automatic: false,
+            checking_automatic: false,
             busy: false,
             applying: false,
         };

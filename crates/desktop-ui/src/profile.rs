@@ -1,14 +1,19 @@
 //! Portable avatar persistence, native file selection and cached texture ownership.
 use super::View;
 use p2pshare_media::profile_history::History;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, mpsc},
+};
 #[derive(Default)]
 pub(super) struct Store {
     initialized: bool,
     history: History,
     seen: HashMap<String, (String, Option<Arc<[u8]>>)>,
+    nicknames_loaded: HashSet<String>,
     own: Option<Arc<[u8]>>,
     textures: HashMap<String, (Arc<[u8]>, egui::TextureHandle)>,
+    picker: Option<mpsc::Receiver<Result<Option<p2pshare_media::avatar::Source>, String>>>,
 }
 fn pick(owner: windows::Win32::Foundation::HWND) -> anyhow::Result<Option<std::path::PathBuf>> {
     use windows::Win32::UI::Controls::Dialogs::*;
@@ -36,16 +41,47 @@ fn pick(owner: windows::Win32::Foundation::HWND) -> anyhow::Result<Option<std::p
         &name[..length],
     )?)))
 }
+fn pick_avatar_source() -> anyhow::Result<Option<p2pshare_media::avatar::Source>> {
+    use windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+    };
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+    }
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    let _apartment = Apartment;
+    let Some(path) = pick(windows::Win32::Foundation::HWND::default())? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        std::fs::metadata(&path)?.len() <= 16 * 1024 * 1024,
+        "Image exceeds 16 MB"
+    );
+    let image = p2pshare_media::avatar::source(&std::fs::read(path)?)?;
+    Ok(Some(image))
+}
 impl View {
     pub(super) fn choose_avatar(&mut self) -> anyhow::Result<()> {
-        if let Some(path) = pick(self.hwnd)? {
-            anyhow::ensure!(
-                std::fs::metadata(&path)?.len() <= 16 * 1024 * 1024,
-                "Image exceeds 16 MB"
-            );
-            let image = p2pshare_media::avatar::source(&std::fs::read(path)?)?;
-            self.design.load_profile_image(&self.ctx, image);
+        if self.avatars.picker.is_some() {
+            return Ok(());
         }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::Builder::new()
+            .name("avatar-picker".into())
+            .spawn(move || {
+                let result = pick_avatar_source().map_err(|error| format!("{error:#}"));
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            })?;
+        self.avatars.picker = Some(rx);
         Ok(())
     }
     pub(super) fn save_avatar(&mut self, bytes: Option<Vec<u8>>) -> anyhow::Result<()> {
@@ -99,6 +135,25 @@ impl View {
     }
 
     pub(super) fn sync_avatars(&mut self) {
+        if let Some(rx) = &self.avatars.picker {
+            let outcome = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Ok(None)),
+            };
+            if let Some(result) = outcome {
+                self.avatars.picker = None;
+                match result {
+                    Ok(Some(image)) => self.design.load_profile_image(&self.ctx, image),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "avatar_choose_failed");
+                        self.design.notice = format!("Could not load image: {error}");
+                        self.ui.status = self.design.notice.clone();
+                    }
+                }
+            }
+        }
         if !self.avatars.initialized {
             self.avatars.initialized = true;
             let path = self
@@ -150,6 +205,9 @@ impl View {
         self.avatars
             .seen
             .retain(|key, _| entries.iter().any(|(k, _, _)| k == key));
+        self.avatars
+            .nicknames_loaded
+            .retain(|key| entries.iter().any(|(k, _, _)| k == key));
         self.design
             .profile_names
             .retain(|id, _| entries.iter().any(|(_, i, _)| i == id));
@@ -160,7 +218,7 @@ impl View {
             .profile_nicknames
             .retain(|id, _| entries.iter().any(|(_, i, _)| i == id));
         for (key, id, bytes) in entries {
-            if id != 0 && !self.avatars.seen.contains_key(&key) {
+            if id != 0 && self.avatars.nicknames_loaded.insert(key.clone()) {
                 if let Ok(data) = p2pshare_media::portable::data_dir() {
                     match read_nickname(&data, &key) {
                         Ok(Some(nickname)) => { self.design.profile_nicknames.insert(id, nickname); }

@@ -213,57 +213,101 @@ impl CaptureBackend for WindowsCapture {
                 "Restore the selected window before starting capture",
             ));
         }
+        struct SetupGuard<'a> {
+            item: &'a GraphicsCaptureItem,
+            closed_token: Option<i64>,
+            pool: Option<Direct3D11CaptureFramePool>,
+            frame_token: Option<i64>,
+        }
+        impl Drop for SetupGuard<'_> {
+            fn drop(&mut self) {
+                if let (Some(pool), Some(token)) = (&self.pool, self.frame_token.take()) {
+                    let _ = pool.RemoveFrameArrived(token);
+                }
+                if let Some(pool) = self.pool.take() {
+                    let _ = pool.Close();
+                }
+                if let Some(token) = self.closed_token.take() {
+                    let _ = self.item.RemoveClosed(token);
+                }
+            }
+        }
+        let mut guard = SetupGuard {
+            item: &item,
+            closed_token: None,
+            pool: None,
+            frame_token: None,
+        };
         let closed = Arc::new(AtomicBool::new(false));
         let signal = closed.clone();
-        let token = item.Closed(&TypedEventHandler::new(move |_, _| {
+        guard.closed_token = Some(item.Closed(&TypedEventHandler::new(move |_, _| {
             signal.store(true, Ordering::Relaxed);
             Ok(())
-        }))?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+        }))?);
+        guard.pool = Some(Direct3D11CaptureFramePool::CreateFreeThreaded(
             &self.graphics.winrt,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
             size,
-        )?;
+        )?);
         let frame_ready = Arc::new(AtomicBool::new(false));
         let arrived = frame_ready.clone();
-        let frame_token = pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
-            arrived.store(true, Ordering::Release);
-            Ok(())
-        }))?;
-        let capture = pool.CreateCaptureSession(&item)?;
-        // Full-trust desktop capture, as used by Sunshine. Older Windows versions
-        // may not expose the border toggle; capture must still work there.
-        if let Err(error) = capture.SetIsBorderRequired(false) {
-            tracing::warn!(%error, "capture_border_toggle_unavailable");
-        }
-        if !self.show_cursor{capture.SetIsCursorCaptureEnabled(false)?;}
-        capture.StartCapture()?;
-        self.session = Some(Session {
+        guard.frame_token = Some(
+            guard
+                .pool
+                .as_ref()
+                .unwrap()
+                .FrameArrived(&TypedEventHandler::new(move |_, _| {
+                    arrived.store(true, Ordering::Release);
+                    Ok(())
+                }))?,
+        );
+        let capture = guard.pool.as_ref().unwrap().CreateCaptureSession(&item)?;
+        let session = Session {
             source: source.clone(),
-            item,
-            closed_token: token,
+            item: item.clone(),
+            closed_token: guard.closed_token.take().unwrap(),
             closed,
-            pool,
-            frame_token,
+            pool: guard.pool.take().unwrap(),
+            frame_token: guard.frame_token.take().unwrap(),
             frame_ready,
             capture,
             pool_size: size,
             sequence: 0,
-            suspended:false,
+            suspended: false,
             copy: None,
-        });
+        };
+        drop(guard);
+        // Full-trust desktop capture, as used by Sunshine. Older Windows versions
+        // may not expose border/cursor toggles; capture must still work there.
+        if let Err(error) = session.capture.SetIsBorderRequired(false) {
+            tracing::warn!(%error, "capture_border_toggle_unavailable");
+        }
+        if !self.show_cursor
+            && let Err(error) = session.capture.SetIsCursorCaptureEnabled(false)
+        {
+            tracing::warn!(%error, "capture_cursor_toggle_unavailable");
+        }
+        session.capture.StartCapture()?;
+        self.session = Some(session);
         tracing::info!(kind=?source.kind,width=size.Width,height=size.Height,"Capture started");
         Ok(())
     }
     fn poll_frame(&mut self) -> Result<Option<GpuFrame>> {
-        if self.state() != CaptureState::Capturing {
-            return Ok(None);
-        }
+        let state = self.state();
         let Some(session) = &mut self.session else {
             return Ok(None);
         };
-        if session.source.kind==SourceKind::Window&&unsafe{windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(session.source.id as *mut _)).as_bool()}{if !session.suspended{tracing::info!(reason="minimized","capture_transition_paused");session.suspended=true;}return Ok(None);}
+        if state == CaptureState::Paused {
+            if !session.suspended {
+                tracing::info!(reason = "minimized", "capture_transition_paused");
+                session.suspended = true;
+            }
+            return Ok(None);
+        }
+        if state != CaptureState::Capturing {
+            return Ok(None);
+        }
         if !session.frame_ready.swap(false, Ordering::Acquire) {
             return Ok(None);
         }

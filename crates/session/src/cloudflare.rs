@@ -13,6 +13,9 @@ use std::{
 use tokio_websockets::{ClientBuilder, Limits, Message};
 
 const MAX_VIEWER_LIST_BYTES: usize = 49153;
+const MAX_NAMED_ROOM_PEERS: usize = 64;
+const OFFER_RATE_WINDOW: Duration = Duration::from_secs(2);
+const MAX_OFFERS_PER_WINDOW: usize = 3;
 const ROOM_FULL_STATUS: &str = "Room is full. Waiting for a spot…";
 
 #[derive(Serialize, Deserialize)]
@@ -185,12 +188,18 @@ impl RemoteMember {
         }
     }
 }
+struct RefreshOutput {
+    ips: Vec<std::net::IpAddr>,
+    sockets: stun::Sockets,
+    gather: stun::GatherResult,
+    rebound: bool,
+}
 enum Event {
     Text(u64, String),
     Closed(u64, bool),
     Failed(u64, Option<u16>),
     Rejected(u64, u16),
-    Gathered(u64, Result<(stun::Sockets, Vec<IceCandidate>), String>),
+    Gathered(u64, Result<RefreshOutput, String>),
 }
 struct SocketTask {
     sender: mpsc::Sender<String>,
@@ -310,12 +319,18 @@ pub(super) struct CloudflareActor {
     incoming: mpsc::Receiver<Event>,
     peers: HashMap<String, PeerRtc>,
     sockets: stun::Sockets,
+    observed_interfaces: Vec<std::net::IpAddr>,
+    stun_mappings: std::collections::HashSet<(SocketAddr, SocketAddr)>,
+    symmetric_nat: bool,
     candidates: Vec<IceCandidate>,
+    udp_routes: HashMap<(SocketAddr, SocketAddr), String>,
+    offer_times: HashMap<String, VecDeque<Instant>>,
     members: Vec<Member>,
     sessions: HashMap<String, String>,
     room: Option<CloudflareInvite>,
     socket: Option<SocketTask>,
     generation: u64,
+    gather_generation: u64,
     own_session: String,
     in_room: bool,
     name: String,
@@ -376,7 +391,7 @@ impl CloudflareActor {
         let local = hex(key.verifying_key().as_bytes());
         let room_file = identity.with_extension("cloudflare-room.json");
         let (datagrams, internal) = mpsc::channel(1024);
-        let (sockets, candidates) = media_sockets(datagrams.clone(), isolated).await?;
+        let opened = media_sockets(datagrams.clone(), isolated).await?;
         let (events, incoming) = mpsc::channel(128);
         {
             let mut s = state.lock().unwrap();
@@ -388,7 +403,11 @@ impl CloudflareActor {
                 .and_then(|i| i.upgraded().ok())
                 .and_then(|i| i.encode().ok());
             s.status = "Enter a room name to join".into();
-            s.discovery_status = "Cloudflare signaling • direct encrypted video".into();
+            s.discovery_status = if opened.gather.symmetric_nat {
+                "Cloudflare signaling • direct encrypted video • Symmetric NAT/VPN detected".into()
+            } else {
+                "Cloudflare signaling • direct encrypted video".into()
+            };
         }
         Ok(Self {
             local,
@@ -405,13 +424,19 @@ impl CloudflareActor {
             events,
             incoming,
             peers: HashMap::new(),
-            sockets,
-            candidates,
+            sockets: opened.sockets,
+            observed_interfaces: opened.ips,
+            stun_mappings: opened.gather.mappings,
+            symmetric_nat: opened.gather.symmetric_nat,
+            candidates: opened.gather.candidates,
+            udp_routes: HashMap::new(),
+            offer_times: HashMap::new(),
             members: vec![],
             sessions: HashMap::new(),
             room: None,
             socket: None,
             generation: 0,
+            gather_generation: 0,
             own_session: String::new(),
             in_room: false,
             name: "Guest".into(),
@@ -453,7 +478,7 @@ impl CloudflareActor {
         let Some(invite) = self.room.clone() else {
             return;
         };
-        let (sender, outgoing) = mpsc::channel(64);
+        let (sender, outgoing) = mpsc::channel(256);
         let events = self.events.clone();
         let generation = self.generation;
         let key = self.key.clone();
@@ -487,7 +512,10 @@ impl CloudflareActor {
     }
     fn reset_media(&mut self) {
         self.peers.clear();
+        self.udp_routes.clear();
+        self.offer_times.clear();
         self.recovery.clear();
+        self.gather_generation += 1;
         self.gather_task = None;
         self.gathering = false;
         self.state.lock().unwrap().viewer_count = 0;
@@ -590,8 +618,8 @@ impl CloudflareActor {
                 self.keyframe.store(true, Ordering::Relaxed);
                 self.send_share()?;
                 for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
-                    self.send_preview(&peer).await?;
-                    self.send_stream_info(&peer).await?;
+                    self.send_preview(&peer).await;
+                    self.send_stream_info(&peer).await;
                 }
             }
             Command::Unpublish => {
@@ -607,27 +635,42 @@ impl CloudflareActor {
             }
             Command::RequestKeyframe(peer) => {
                 if let Some(rtc) = self.peers.get_mut(&peer) {
-                    rtc.request_keyframe()?;
-                    self.drain(&peer).await?;
+                    match rtc.request_keyframe() {
+                        Ok(()) => self.drain(&peer).await,
+                        Err(error) => {
+                            tracing::warn!(peer, %error, "request_keyframe_failed");
+                            self.failed_peer(&peer, &format!("keyframe request: {error:#}"));
+                        }
+                    }
                 }
             }
             Command::Watch { peer, enabled } => {
-                if let Some(rtc) = self.peers.get_mut(&peer) {
-                    let _ = rtc.send_control(&[1, enabled as u8])?;
-                    self.drain(&peer).await?;
-                }
+                self.send_priority_control(&peer, &[1, enabled as u8]).await;
             }
-            Command::Avatar(bytes)=>{
-                use sha2::{Digest,Sha256};
-                let hash=if let Some(bytes)=bytes {p2pshare_media::avatar::validate(&bytes)?;let hash=format!("{:x}",Sha256::digest(&bytes));let mut inbox=self.inbox.lock().unwrap();inbox.avatar_cache.insert(hash.clone(),bytes.into());inbox.avatar_hashes.insert(self.local.clone(),hash.clone());hash}else{self.inbox.lock().unwrap().avatar_hashes.remove(&self.local);String::new()};
-                let _=hash;for peer in self.peers.keys().cloned().collect::<Vec<_>>(){self.send_avatar_hash(&peer).await?;}
+            Command::Avatar(bytes) => {
+                use sha2::{Digest, Sha256};
+                let hash = if let Some(bytes) = bytes {
+                    p2pshare_media::avatar::validate(&bytes)?;
+                    let hash = format!("{:x}", Sha256::digest(&bytes));
+                    let mut inbox = self.inbox.lock().unwrap();
+                    inbox.avatar_cache.insert(hash.clone(), bytes.into());
+                    inbox.avatar_hashes.insert(self.local.clone(), hash.clone());
+                    hash
+                } else {
+                    self.inbox.lock().unwrap().avatar_hashes.remove(&self.local);
+                    String::new()
+                };
+                let _ = hash;
+                for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
+                    self.send_avatar_hash(&peer).await;
+                }
             }
             Command::Preview(bytes) => {
                 if bytes.len() <= p2pshare_media::preview::MAX_BYTES && self.in_room {
                     self.preview = Some(bytes);
                     for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
                         if !self.viewers.contains(&peer) {
-                            self.send_preview(&peer).await?;
+                            self.send_preview(&peer).await;
                         }
                     }
                 }
@@ -636,7 +679,7 @@ impl CloudflareActor {
                 if info.valid() {
                     self.inbox.lock().unwrap().own_stream_info = Some(info);
                     for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
-                        self.send_stream_info(&peer).await?;
+                        self.send_stream_info(&peer).await;
                     }
                 }
             }
@@ -723,20 +766,58 @@ impl CloudflareActor {
                 }
                 match message["kind"].as_str() {
                     Some("offer") if self.local.as_str() > peer => {
-                        // A new offer replaces only this peer, never healthy room peers.
-                        self.replace_peer(peer)?;
+                        if token.is_some()
+                            && self
+                                .recovery
+                                .get(peer)
+                                .is_some_and(|r| r.negotiated && r.token == token)
+                        {
+                            tracing::info!(peer, "media_duplicate_offer_ignored");
+                            return Ok(());
+                        }
+                        let now = Instant::now();
+                        let times = self.offer_times.entry(peer.into()).or_default();
+                        while times
+                            .front()
+                            .is_some_and(|t| now.duration_since(*t) > OFFER_RATE_WINDOW)
+                        {
+                            times.pop_front();
+                        }
+                        if times.len() >= MAX_OFFERS_PER_WINDOW {
+                            tracing::warn!(peer, "media_offer_rate_limited");
+                            return Ok(());
+                        }
+                        // Validate incoming offer into a fresh PeerRtc before replacing a healthy peer.
+                        let mut candidate_rtc = PeerRtc::new(&self.candidates)?;
+                        candidate_rtc.set_peer_label(peer.into());
+                        let answer = candidate_rtc.accept_offer(payload)?;
+                        let tagged_answer = tagged_sdp(answer, token.as_deref())?;
+                        self.offer_times
+                            .entry(peer.into())
+                            .or_default()
+                            .push_back(now);
+                        self.commit_peer(peer, candidate_rtc);
                         self.recovery
                             .get_mut(peer)
                             .unwrap()
-                            .attempting(Instant::now(), token.clone());
-                        let answer = self.peers.get_mut(peer).unwrap().accept_offer(payload)?;
+                            .attempting(now, token.clone());
                         self.recovery.get_mut(peer).unwrap().negotiated = true;
-                        self.signal(peer, true, tagged_sdp(answer, token.as_deref())?)?;
+                        self.signal(peer, true, tagged_answer)?;
+                        tracing::info!(
+                            peer,
+                            local_candidates = %candidate_summary(&self.candidates),
+                            remote_candidates = %sdp_candidate_summary(payload),
+                            "media_offer_accepted"
+                        );
                     }
                     Some("answer") if self.local.as_str() < peer => {
                         let Some(attempt) = self.recovery.get(peer) else {
                             return Ok(());
                         };
+                        if attempt.negotiated {
+                            tracing::info!(peer, "media_duplicate_answer_ignored");
+                            return Ok(());
+                        }
                         // Old clients omit the token; permit that on the first attempt only.
                         if token != attempt.token && !(token.is_none() && attempt.failures == 0) {
                             tracing::info!(peer, "media_stale_answer_ignored");
@@ -746,6 +827,12 @@ impl CloudflareActor {
                             .get_mut(peer)
                             .context("Missing media peer")?
                             .accept_answer(payload)?;
+                        tracing::info!(
+                            peer,
+                            local_candidates = %candidate_summary(&self.candidates),
+                            remote_candidates = %sdp_candidate_summary(payload),
+                            "media_answer_accepted"
+                        );
                     }
                     Some("ice") if value["candidates"].is_array() => {
                         self.remote_candidates(peer, token.as_deref(), &value["candidates"])
@@ -765,7 +852,7 @@ impl CloudflareActor {
                     _ => return Ok(()),
                 }
                 self.recovery.get_mut(peer).unwrap().negotiated = true;
-                self.drain(peer).await?;
+                self.drain(peer).await;
                 self.sync_candidates(peer).await?;
             }
             Some("error") => {
@@ -783,14 +870,30 @@ impl CloudflareActor {
         self.send(json!({"type":"signal","to":peer,"to_session":self.sessions.get(peer).context("Peer left")?,
             "kind":if answer {"answer"}else{"offer"},"payload":sdp}))
     }
+    async fn init_peer_session(&mut self, peer: &str) -> Result<()> {
+        self.replace_peer(peer)?;
+        if self.local.as_str() < peer {
+            let sdp = self.peers.get_mut(peer).unwrap().offer()?;
+            self.drain(peer).await;
+            let token = format!("{:016x}", rand::random::<u64>());
+            self.recovery.get_mut(peer).unwrap().token = Some(token.clone());
+            self.signal(peer, false, tagged_sdp(sdp, Some(&token))?)?;
+            tracing::info!(
+                peer,
+                local_candidates = %candidate_summary(&self.candidates),
+                "media_offer_sent"
+            );
+        }
+        Ok(())
+    }
     async fn roster(&mut self, members: Vec<RemoteMember>) -> Result<()> {
         let public: Vec<_> = members.iter().map(RemoteMember::member).collect();
-        let legacy_limit = self
-            .room
-            .as_ref()
-            .filter(|invite| invite.version == 5)
-            .map(|_| MAX_PEERS);
-        validate_members(&public, &self.local, legacy_limit)?;
+        let limit = if self.room.as_ref().is_some_and(|invite| invite.version == 5) {
+            Some(MAX_PEERS)
+        } else {
+            Some(MAX_NAMED_ROOM_PEERS)
+        };
+        validate_members(&public, &self.local, limit)?;
         let mut sessions = HashMap::new();
         for m in &members {
             if m.session.len() != 22 || URL_SAFE_NO_PAD.decode(&m.session)?.len() != 16 {
@@ -803,6 +906,8 @@ impl CloudflareActor {
         }
         self.peers
             .retain(|id, _| self.sessions.get(id) == sessions.get(id) && sessions.contains_key(id));
+        self.udp_routes.retain(|_, id| self.peers.contains_key(id));
+        self.offer_times.retain(|id, _| self.peers.contains_key(id));
         {
             let mut inbox = self.inbox.lock().unwrap();
             let live = |id: &String| {
@@ -841,14 +946,10 @@ impl CloudflareActor {
                 continue;
             }
             added = true;
-            tracing::info!(peer=%m.id,"signaling_peer_media_created");
-            self.replace_peer(&m.id)?;
-            if self.local < m.id {
-                let sdp = self.peers.get_mut(&m.id).unwrap().offer()?;
-                self.drain(&m.id).await?;
-                let token = format!("{:016x}", rand::random::<u64>());
-                self.recovery.get_mut(&m.id).unwrap().token = Some(token.clone());
-                self.signal(&m.id, false, tagged_sdp(sdp, Some(&token))?)?;
+            tracing::info!(peer = %m.id, "signaling_peer_media_created");
+            if let Err(error) = self.init_peer_session(&m.id).await {
+                tracing::warn!(peer = %m.id, %error, "signaling_peer_init_failed");
+                self.failed_peer(&m.id, &format!("init: {error:#}"));
             }
         }
         if added && self.refreshed.elapsed() > Duration::from_secs(2) {
@@ -878,10 +979,10 @@ impl CloudflareActor {
                 frame=self.video.recv()=>match frame {Some(frame)=>self.publish_frame(frame).await,None=>Ok(())},
                 event=self.incoming.recv()=>match event {
                     Some(Event::Text(g,text)) if g==self.generation=>self.text(text).await,
-                    Some(Event::Gathered(g,result)) if g==self.generation=>{
+                    Some(Event::Gathered(g,result)) if g==self.gather_generation=>{
                         self.gather_task=None;self.gathering=false;self.refreshed=Instant::now();
                         match result {
-                            Ok((sockets,candidates))=>self.apply_candidates(sockets,candidates).await?,
+                            Ok(output)=>self.apply_candidates(output.ips,output.sockets,output.gather,output.rebound).await,
                             Err(error)=>tracing::warn!(%error,"media_candidate_refresh_failed"),
                         }
                         Ok(())
@@ -904,11 +1005,34 @@ impl CloudflareActor {
                 },
                 event=self.internal.recv()=>match event {
                     Some(Internal::Datagram{source,destination,data})=>async {
-                        let peer=self.peers.iter().find(|(_,rtc)|rtc.accepts(source,destination,&data)).map(|(id,_)|id.clone());
+                        let cached = self.udp_routes.get(&(source, destination)).cloned();
+                        let peer = if let Some(peer) = cached
+                            && self
+                                .peers
+                                .get(&peer)
+                                .is_some_and(|rtc| rtc.accepts(source, destination, &data))
+                        {
+                            Some(peer)
+                        } else {
+                            let found = self
+                                .peers
+                                .iter()
+                                .find(|(_, rtc)| rtc.accepts(source, destination, &data))
+                                .map(|(id, _)| id.clone());
+                            if let Some(peer) = &found {
+                                if self.udp_routes.len() >= 1024 {
+                                    self.udp_routes.clear();
+                                }
+                                self.udp_routes.insert((source, destination), peer.clone());
+                            } else {
+                                self.udp_routes.remove(&(source, destination));
+                            }
+                            found
+                        };
                         if let Some(peer)=peer {
                             if let Some(r)=self.recovery.get_mut(&peer) {r.rx_packets+=1;}
                             match self.peers.get_mut(&peer).unwrap().receive(source,destination,&data) {
-                                Ok(())=>self.drain(&peer).await,
+                                Ok(())=>{self.drain(&peer).await;Ok(())},
                                 Err(error)=>{self.failed_peer(&peer,&format!("receive: {error:#}"));Ok(())}
                             }
                         }else{
@@ -931,39 +1055,71 @@ impl CloudflareActor {
         }
         Ok(())
     }
+    fn update_discovery_status(&self) {
+        let ipv6 = self
+            .peers
+            .values()
+            .filter(|p| p.connected && p.path_version() == Some("IPv6"))
+            .count();
+        let ipv4 = self
+            .peers
+            .values()
+            .filter(|p| p.connected && p.path_version() == Some("IPv4"))
+            .count();
+        let nat_note = if self.symmetric_nat {
+            " • Symmetric NAT/VPN detected"
+        } else {
+            ""
+        };
+        self.state.lock().unwrap().discovery_status = format!(
+            "Direct IPv6: {ipv6} • Direct IPv4: {ipv4} • Cloudflare signaling{nat_note}"
+        );
+    }
     async fn apply_candidates(
         &mut self,
+        ips: Vec<std::net::IpAddr>,
         sockets: stun::Sockets,
-        candidates: Vec<IceCandidate>,
-    ) -> Result<()> {
-        let changed = sockets.keys().any(|a| !self.sockets.contains_key(a))
-            || sockets.len() != self.sockets.len();
+        gather: stun::GatherResult,
+        rebound: bool,
+    ) {
+        let changed = rebound || ips != self.observed_interfaces;
         let previous: std::collections::HashSet<_> = self
             .candidates
             .iter()
             .map(IceCandidate::to_sdp_string)
             .collect();
-        let added = candidates
+        let added = gather
+            .candidates
             .iter()
             .filter(|c| !previous.contains(&c.to_sdp_string()))
             .count();
+        self.observed_interfaces = ips;
+        self.symmetric_nat = gather.symmetric_nat;
+        self.stun_mappings = gather.mappings;
         self.sockets = sockets;
-        self.candidates = candidates;
-        if added > 0 {
+        self.candidates = gather.candidates;
+        if changed {
+            self.udp_routes.clear();
+        }
+        if self.in_room {
+            self.update_discovery_status();
+        }
+        if added > 0 || changed {
             tracing::info!(
                 added,
                 interfaces_changed = changed,
+                symmetric_nat = self.symmetric_nat,
                 "media_candidates_changed"
             );
         }
         for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
             if changed {
                 self.failed_peer(&peer, "network interfaces changed");
-            } else {
-                self.sync_candidates(&peer).await?;
+            } else if let Err(error) = self.sync_candidates(&peer).await {
+                tracing::warn!(peer, %error, "sync_candidates_failed");
+                self.failed_peer(&peer, &format!("candidate sync: {error:#}"));
             }
         }
-        Ok(())
     }
     async fn sync_candidates(&mut self, peer: &str) -> Result<()> {
         let Some(recovery) = self.recovery.get(peer) else {
@@ -1002,7 +1158,7 @@ impl CloudflareActor {
                 .get_mut(peer)
                 .context("Missing media peer")?
                 .add_local_candidate(candidate);
-            self.drain(peer).await?;
+            self.drain(peer).await;
         }
         self.send(
             json!({"type":"signal","to":peer,"to_session":self.sessions.get(peer),"kind":"ice",
@@ -1016,6 +1172,7 @@ impl CloudflareActor {
         tracing::info!(
             peer,
             added = pending.len(),
+            candidates = %candidate_summary(&pending),
             "media_local_candidates_trickled"
         );
         Ok(())
@@ -1065,6 +1222,7 @@ impl CloudflareActor {
             "Remote ICE candidate update limit exceeded"
         );
         let count = pending.len();
+        let mut added_candidates = Vec::with_capacity(count);
         for (text, candidate) in pending {
             self.peers
                 .get_mut(peer)
@@ -1075,10 +1233,16 @@ impl CloudflareActor {
                 .unwrap()
                 .remote_candidates
                 .insert(text);
-            self.drain(peer).await?;
+            added_candidates.push(candidate);
+            self.drain(peer).await;
         }
         if count > 0 {
-            tracing::info!(peer, added = count, "media_remote_candidates_added");
+            tracing::info!(
+                peer,
+                added = count,
+                candidates = %candidate_summary(&added_candidates),
+                "media_remote_candidates_added"
+            );
         }
         Ok(())
     }
@@ -1091,9 +1255,10 @@ impl CloudflareActor {
         }
         self.frame(frame).await
     }
-    fn replace_peer(&mut self, peer: &str) -> Result<()> {
-        self.peers
-            .insert(peer.into(), PeerRtc::new(&self.candidates)?);
+    fn commit_peer(&mut self, peer: &str, mut rtc: PeerRtc) {
+        rtc.set_peer_label(peer.into());
+        self.peers.insert(peer.into(), rtc);
+        self.udp_routes.retain(|_, id| id != peer);
         self.recovery
             .entry(peer.into())
             .or_insert_with(|| recovery::Recovery::new(Instant::now()));
@@ -1116,6 +1281,10 @@ impl CloudflareActor {
         inbox.bytes.remove(peer);
         inbox.waiting.remove(peer);
         inbox.timelines.remove(peer);
+    }
+    fn replace_peer(&mut self, peer: &str) -> Result<()> {
+        let rtc = PeerRtc::new(&self.candidates)?;
+        self.commit_peer(peer, rtc);
         Ok(())
     }
     fn failed_peer(&mut self, peer: &str, reason: &str) {
@@ -1143,69 +1312,89 @@ impl CloudflareActor {
         let mut state = self.state.lock().unwrap();
         state.viewer_count = self.viewers.len();
         state.connected_video.retain(|id| id != peer);
-        state.status =
+        state.status = if self.symmetric_nat {
+            "Peer connection failed • retrying; symmetric NAT or VPN detected".into()
+        } else {
             "Peer connection failed • retrying direct IPv4/IPv6; firewall or NAT may block UDP"
-                .into();
+                .into()
+        };
     }
     fn refresh_candidates(&mut self) {
         if self.gathering {
             return;
         }
         self.gathering = true;
+        self.gather_generation += 1;
         let sockets = self.sockets.clone();
+        let observed = self.observed_interfaces.clone();
+        let known = self.stun_mappings.clone();
         let events = self.events.clone();
-        let generation = self.generation;
+        let gather_generation = self.gather_generation;
         let datagrams = self.datagrams.clone();
         let isolated = self.isolated;
         self.gather_task = Some(GatherTask(tokio::spawn(async move {
             let result = async {
                 let ips = stun::interfaces(isolated)?;
-                let changed = ips.len() != sockets.len()
-                    || ips.iter().any(|ip| !sockets.keys().any(|a| a.ip() == *ip));
-                if changed {
-                    stun::open(datagrams, isolated).await
+                if ips != observed {
+                    let opened = stun::open_with_ips(ips, datagrams).await?;
+                    Ok(RefreshOutput {
+                        ips: opened.ips,
+                        sockets: opened.sockets,
+                        gather: opened.gather,
+                        rebound: true,
+                    })
                 } else {
-                    let candidates = stun::gather(&sockets).await;
-                    Ok((sockets, candidates))
+                    let gather = stun::gather(&sockets, &known).await;
+                    Ok(RefreshOutput {
+                        ips,
+                        sockets,
+                        gather,
+                        rebound: false,
+                    })
                 }
             }
             .await
             .map_err(|e: anyhow::Error| format!("{e:#}"));
-            let _ = events.send(Event::Gathered(generation, result)).await;
+            let _ = events.send(Event::Gathered(gather_generation, result)).await;
         })));
     }
     async fn tick(&mut self) -> Result<()> {
-        let mut viewers:Vec<_>=self.viewers.iter().cloned().collect();viewers.sort();
-        let changed={let mut inbox=self.inbox.lock().unwrap();if inbox.stream_viewers.get(&self.local)!=Some(&viewers){inbox.stream_viewers.insert(self.local.clone(),viewers);true}else{false}};
-        if changed{for peer in self.peers.keys().cloned().collect::<Vec<_>>(){self.send_watchers(&peer).await?;}}
+        let mut viewers: Vec<_> = self.viewers.iter().cloned().collect();
+        viewers.sort();
+        let changed = {
+            let mut inbox = self.inbox.lock().unwrap();
+            if inbox.stream_viewers.get(&self.local) != Some(&viewers) {
+                inbox.stream_viewers.insert(self.local.clone(), viewers);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            for peer in self.peers.keys().cloned().collect::<Vec<_>>() {
+                self.send_watchers(&peer).await;
+            }
+        }
 
         if self.reconnect.is_some_and(|t| Instant::now() >= t) {
             self.connect();
         }
         let now = Instant::now();
-        // Keep discovery mappings fresh without renegotiating healthy peers.
-        if self.in_room && self.refreshed.elapsed() >= Duration::from_secs(8) {
+        // Keep discovery mappings fresh without spamming DNS/STUN while all peers are healthy.
+        let any_unready = self.recovery.values().any(|r| !r.ready);
+        let refresh_interval = if any_unready {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(60)
+        };
+        if self.in_room && self.refreshed.elapsed() >= refresh_interval {
             self.refresh_candidates();
         }
         if self.in_room && self.interface_check.elapsed() >= Duration::from_secs(5) {
             self.interface_check = now;
-            let ipv6 = self
-                .peers
-                .values()
-                .filter(|p| p.connected && p.path_version() == Some("IPv6"))
-                .count();
-            let ipv4 = self
-                .peers
-                .values()
-                .filter(|p| p.connected && p.path_version() == Some("IPv4"))
-                .count();
-            self.state.lock().unwrap().discovery_status =
-                format!("Direct IPv6: {ipv6} • Direct IPv4: {ipv4} • Cloudflare signaling");
+            self.update_discovery_status();
             if let Ok(ips) = stun::interfaces(self.isolated)
-                && (ips.len() != self.sockets.len()
-                    || ips
-                        .iter()
-                        .any(|ip| !self.sockets.keys().any(|a| a.ip() == *ip)))
+                && ips != self.observed_interfaces
             {
                 self.refresh_candidates();
             }
@@ -1235,19 +1424,41 @@ impl CloudflareActor {
             if !self.gathering {
                 for peer in due {
                     if self.local < peer {
-                        self.replace_peer(&peer)?;
-                        let token = format!("{:016x}", rand::random::<u64>());
-                        self.recovery
-                            .get_mut(&peer)
-                            .unwrap()
-                            .attempting(now, Some(token.clone()));
-                        let sdp = self.peers.get_mut(&peer).unwrap().offer()?;
-                        self.signal(&peer, false, tagged_sdp(sdp, Some(&token))?)?;
-                        tracing::info!(%peer,"media_direct_connection_retry_started");
-                        self.drain(&peer).await?;
+                        let attempt = (|| -> Result<()> {
+                            self.replace_peer(&peer)?;
+                            let token = format!("{:016x}", rand::random::<u64>());
+                            self.recovery
+                                .get_mut(&peer)
+                                .unwrap()
+                                .attempting(now, Some(token.clone()));
+                            let sdp = self.peers.get_mut(&peer).unwrap().offer()?;
+                            self.signal(&peer, false, tagged_sdp(sdp, Some(&token))?)?;
+                            tracing::info!(
+                                %peer,
+                                local_candidates = %candidate_summary(&self.candidates),
+                                "media_direct_connection_retry_started"
+                            );
+                            Ok(())
+                        })();
+                        match attempt {
+                            Ok(()) => self.drain(&peer).await,
+                            Err(error) => {
+                                tracing::warn!(%peer, %error, "media_retry_offer_failed");
+                                self.failed_peer(&peer, &format!("retry offer: {error:#}"));
+                            }
+                        }
                     } else {
                         // Ask the designated offerer; never send competing offers.
-                        self.send(json!({"type":"signal","to":peer,"to_session":self.sessions.get(&peer),"kind":"ice","payload":"{\"restart\":true}"}))?;
+                        if let Err(error) = self.send(json!({
+                            "type": "signal",
+                            "to": peer,
+                            "to_session": self.sessions.get(&peer),
+                            "kind": "ice",
+                            "payload": "{\"restart\":true}"
+                        })) {
+                            tracing::warn!(%peer, %error, "media_retry_restart_send_failed");
+                            continue;
+                        }
                         self.recovery.get_mut(&peer).unwrap().attempting(now, None);
                     }
                 }
@@ -1261,63 +1472,72 @@ impl CloudflareActor {
             .collect::<Vec<_>>()
         {
             match self.peers.get_mut(&peer).unwrap().tick() {
-                Ok(()) => self.drain(&peer).await?,
+                Ok(()) => self.drain(&peer).await,
                 Err(error) => self.failed_peer(&peer, &format!("RTC tick: {error:#}")),
             }
         }
         Ok(())
     }
-    async fn send_packets(&self, packets: Vec<(SocketAddr, SocketAddr, Vec<u8>)>) {
+    async fn send_packets(&self, peer: &str, packets: Vec<(SocketAddr, SocketAddr, Vec<u8>)>) {
         for (n, (source, destination, bytes)) in packets.into_iter().enumerate() {
             if let Some(socket) = self.sockets.get(&source) {
-                // send_to waits for writable readiness instead of silently losing
-                // fragments of a large IDR when the kernel send buffer is busy.
                 match tokio::time::timeout(
-                    Duration::from_millis(20),
+                    Duration::from_millis(5),
                     socket.send_to(&bytes, destination),
                 )
                 .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "Video UDP send failed"),
-                    Err(_) => tracing::warn!("Video UDP send stalled for 20 ms"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(peer, %source, %destination, %error, "Video UDP send failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(peer, %source, %destination, "Video UDP send stalled for 5 ms");
+                    }
                 }
+            } else {
+                tracing::warn!(peer, %source, %destination, "Video UDP source socket missing");
             }
-            // This runtime also receives RTP/RTX. Large IDRs must not starve it.
-            if n % 64 == 63 {
-                // Socket/AP queues can drop a giant IDR even when send_to
-                // succeeds. Break it into short bursts, allowing UDP receive
-                // and retransmission tasks to run between them.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            } else if n % 16 == 15 {
+            if n % 32 == 31 {
                 tokio::task::yield_now().await;
             }
         }
     }
-    async fn drain(&mut self, peer: &str) -> Result<()> {
-        let out = match self
-            .peers
-            .get_mut(peer)
-            .context("Missing media peer")?
-            .drain()
-        {
-            Ok(out) => out,
-            Err(error) => {
-                self.failed_peer(peer, &format!("RTC output: {error:#}"));
-                return Ok(());
+    async fn drain(&mut self, peer: &str) {
+        let mut queue = std::collections::VecDeque::new();
+        let mut passes = 0u8;
+        loop {
+            if passes < 8 {
+                let out = match self.peers.get_mut(peer) {
+                    Some(rtc) => match rtc.drain() {
+                        Ok(out) => out,
+                        Err(error) => {
+                            self.failed_peer(peer, &format!("RTC output: {error:#}"));
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                if !out.packets.is_empty() {
+                    if let Some(r) = self.recovery.get_mut(peer) {
+                        r.tx_packets += out.packets.len() as u64;
+                    }
+                    self.send_packets(peer, out.packets).await;
+                }
+                queue.extend(out.events);
+                passes += 1;
             }
-        };
-        if let Some(r) = self.recovery.get_mut(peer) {
-            r.tx_packets += out.packets.len() as u64;
-        }
-        self.send_packets(out.packets).await;
-
-        for event in out.events {
+            let Some(event) = queue.pop_front() else {
+                break;
+            };
             match event {
                 RtcEvent::ControlReady => {
                     // A late successful SCTP handshake can finish during retry backoff.
                     // Its usable encrypted channel proves this transport recovered.
-                    self.peers.get_mut(peer).unwrap().connected = true;
+                    if let Some(rtc) = self.peers.get_mut(peer) {
+                        rtc.connected = true;
+                        rtc.deadline = Instant::now();
+                    }
                     {
                         let mut state = self.state.lock().unwrap();
                         if !state.connected_video.iter().any(|id| id == peer) {
@@ -1336,15 +1556,11 @@ impl CloudflareActor {
                         r.connected();
                     }
                     let watching = self.inbox.lock().unwrap().watching.contains(peer);
-                    let _ = self
-                        .peers
-                        .get_mut(peer)
-                        .unwrap()
-                        .send_control(&[1, watching as u8])?;
-                    let feedback = self.peers.get_mut(peer).unwrap().drain()?;
-                    self.send_packets(feedback.packets).await;
-                    self.send_preview(peer).await?;
-                    self.send_stream_info(peer).await?;self.send_watchers(peer).await?;self.send_avatar_hash(peer).await?;
+                    self.write_control_only(peer, &[1, watching as u8], true);
+                    self.write_stream_info_only(peer);
+                    self.write_watchers_only(peer);
+                    self.write_avatar_hash_only(peer);
+                    self.write_preview_only(peer);
                 }
                 RtcEvent::Control(bytes) => {
                     if bytes.len() == 2 && bytes[0] == 1 && bytes[1] <= 1 {
@@ -1356,23 +1572,57 @@ impl CloudflareActor {
                         } else {
                             self.viewers.remove(peer);
                             self.viewers_waiting.remove(peer);
-                            self.send_preview(peer).await?;
+                            self.write_preview_only(peer);
                         }
                         self.state.lock().unwrap().viewer_count = self.viewers.len();
                         tracing::info!(peer, watching = bytes[1] == 1, "remote_watch_subscription");
-                    } else if bytes.first()==Some(&6)&&bytes.len()<=65 {
-                        let hash=String::from_utf8_lossy(&bytes[1..]).to_string();
-                        if hash.is_empty(){self.inbox.lock().unwrap().avatar_hashes.remove(peer);}
-                        else if hash.len()==64&&hash.bytes().all(|b|b.is_ascii_hexdigit()){
-                            let missing={let mut inbox=self.inbox.lock().unwrap();inbox.avatar_hashes.insert(peer.into(),hash.clone());!inbox.avatar_cache.contains_key(&hash)};
-                            if missing{let mut request=vec![7];request.extend(hash.bytes());self.send_profile_control(peer,&request).await?;}
+                    } else if bytes.first() == Some(&6) && bytes.len() <= 65 {
+                        let hash = String::from_utf8_lossy(&bytes[1..]).to_string();
+                        if hash.is_empty() {
+                            self.inbox.lock().unwrap().avatar_hashes.remove(peer);
+                        } else if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            let missing = {
+                                let mut inbox = self.inbox.lock().unwrap();
+                                inbox.avatar_hashes.insert(peer.into(), hash.clone());
+                                !inbox.avatar_cache.contains_key(&hash)
+                            };
+                            if missing {
+                                let mut request = vec![7];
+                                request.extend(hash.bytes());
+                                self.write_control_only(peer, &request, true);
+                            }
                         }
-                    } else if bytes.first()==Some(&7)&&bytes.len()==65 {
-                        let hash=String::from_utf8_lossy(&bytes[1..]).to_string();let avatar={let inbox=self.inbox.lock().unwrap();if inbox.avatar_hashes.get(&self.local)==Some(&hash){inbox.avatar_cache.get(&hash).cloned()}else{None}};
-                        if let Some(avatar)=avatar{let mut out=vec![8];out.extend_from_slice(&avatar);self.send_profile_control(peer,&out).await?;}
-                    } else if bytes.first()==Some(&8)&&bytes.len()<=p2pshare_media::avatar::MAX_BYTES+1 {
-                        use sha2::{Digest,Sha256};let hash=format!("{:x}",Sha256::digest(&bytes[1..]));let mut inbox=self.inbox.lock().unwrap();
-                        if inbox.avatar_hashes.get(peer)==Some(&hash)&&p2pshare_media::avatar::validate(&bytes[1..]).is_ok(){if inbox.avatar_cache.len()>32{let keep:std::collections::HashSet<_>=inbox.avatar_hashes.values().cloned().collect();inbox.avatar_cache.retain(|h,_|keep.contains(h));}inbox.avatar_cache.insert(hash,Arc::from(&bytes[1..]));}
+                    } else if bytes.first() == Some(&7) && bytes.len() == 65 {
+                        let hash = String::from_utf8_lossy(&bytes[1..]).to_string();
+                        let avatar = {
+                            let inbox = self.inbox.lock().unwrap();
+                            if inbox.avatar_hashes.get(&self.local) == Some(&hash) {
+                                inbox.avatar_cache.get(&hash).cloned()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(avatar) = avatar {
+                            let mut out = vec![8];
+                            out.extend_from_slice(&avatar);
+                            self.write_control_only(peer, &out, false);
+                        }
+                    } else if bytes.first() == Some(&8)
+                        && bytes.len() <= p2pshare_media::avatar::MAX_BYTES + 1
+                    {
+                        use sha2::{Digest, Sha256};
+                        let hash = format!("{:x}", Sha256::digest(&bytes[1..]));
+                        let mut inbox = self.inbox.lock().unwrap();
+                        if inbox.avatar_hashes.get(peer) == Some(&hash)
+                            && p2pshare_media::avatar::validate(&bytes[1..]).is_ok()
+                        {
+                            if inbox.avatar_cache.len() > 32 {
+                                let keep: std::collections::HashSet<_> =
+                                    inbox.avatar_hashes.values().cloned().collect();
+                                inbox.avatar_cache.retain(|h, _| keep.contains(h));
+                            }
+                            inbox.avatar_cache.insert(hash, Arc::from(&bytes[1..]));
+                        }
                     } else if bytes.first() == Some(&5) && bytes.len() <= MAX_VIEWER_LIST_BYTES {
                         if let Ok(mut viewers) = serde_json::from_slice::<Vec<String>>(&bytes[1..])
                             && viewers.iter().all(|id| id.len() <= 128)
@@ -1411,6 +1661,20 @@ impl CloudflareActor {
                     }
                 }
                 RtcEvent::Connected => {
+                    let has_control = if let Some(rtc) = self.peers.get_mut(peer) {
+                        rtc.connected = true;
+                        rtc.deadline = Instant::now();
+                        rtc.has_control_channel()
+                    } else {
+                        false
+                    };
+                    if has_control {
+                        if let Some(r) = self.recovery.get_mut(peer) {
+                            r.connected();
+                        }
+                        let watching = self.inbox.lock().unwrap().watching.contains(peer);
+                        self.write_control_only(peer, &[1, watching as u8], true);
+                    }
                     self.keyframe.store(true, Ordering::Relaxed);
                     self.status("Media connected • encrypted peer-to-peer screens".into());
                     self.state.lock().unwrap().connected_video = self
@@ -1474,6 +1738,7 @@ impl CloudflareActor {
                     );
                     if p2pshare_media::diagnostics::enabled() && (keyframe || !contiguous) {
                         tracing::info!(
+                            peer,
                             assembly_ms = received_at.elapsed().as_secs_f64() * 1000.,
                             keyframe,
                             contiguous,
@@ -1487,53 +1752,110 @@ impl CloudflareActor {
                             .is_none_or(|t| t.elapsed() > Duration::from_millis(500))
                     {
                         self.requests.insert(peer.into(), Instant::now());
-                        self.peers.get_mut(peer).unwrap().request_keyframe()?;
-                        // Drain the feedback mutation before the next actor operation.
-                        let feedback = self.peers.get_mut(peer).unwrap().drain()?;
-                        self.send_packets(feedback.packets).await;
+                        if let Some(rtc) = self.peers.get_mut(peer)
+                            && let Err(error) = rtc.request_keyframe()
+                        {
+                            tracing::warn!(peer, %error, "request_keyframe_failed");
+                        }
                     }
                 }
             }
+            if passes < 8 && queue.is_empty() {
+                // Drain any packets/events produced by control writes or PLI feedback above.
+                let out = match self.peers.get_mut(peer) {
+                    Some(rtc) => match rtc.drain() {
+                        Ok(out) => out,
+                        Err(error) => {
+                            self.failed_peer(peer, &format!("RTC output: {error:#}"));
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                if !out.packets.is_empty() {
+                    if let Some(r) = self.recovery.get_mut(peer) {
+                        r.tx_packets += out.packets.len() as u64;
+                    }
+                    self.send_packets(peer, out.packets).await;
+                }
+                queue.extend(out.events);
+                passes += 1;
+            }
         }
-        Ok(())
     }
-    async fn send_profile_control(&mut self,peer:&str,bytes:&[u8])->Result<()>{if let Some(rtc)=self.peers.get_mut(peer){let _=rtc.send_control(bytes)?;let packets=rtc.drain()?.packets;self.send_packets(packets).await;}Ok(())}
-    async fn send_avatar_hash(&mut self,peer:&str)->Result<()>{let hash=self.inbox.lock().unwrap().avatar_hashes.get(&self.local).cloned().unwrap_or_default();let mut out=vec![6];out.extend(hash.bytes());self.send_profile_control(peer,&out).await}
-    async fn send_watchers(&mut self, peer: &str) -> Result<()> {
+    fn write_control_only(&mut self, peer: &str, bytes: &[u8], priority: bool) {
+        if let Some(rtc) = self.peers.get_mut(peer) {
+            let res = if priority {
+                rtc.send_control_priority(bytes)
+            } else {
+                rtc.send_control(bytes)
+            };
+            if let Err(error) = res {
+                tracing::warn!(peer, %error, priority, "control_write_failed");
+                self.failed_peer(peer, &format!("control write: {error:#}"));
+            }
+        }
+    }
+    fn write_avatar_hash_only(&mut self, peer: &str) {
+        let hash = self
+            .inbox
+            .lock()
+            .unwrap()
+            .avatar_hashes
+            .get(&self.local)
+            .cloned()
+            .unwrap_or_default();
+        let mut out = vec![6];
+        out.extend(hash.bytes());
+        self.write_control_only(peer, &out, true);
+    }
+    fn write_watchers_only(&mut self, peer: &str) {
         let mut viewers: Vec<_> = self.viewers.iter().collect();
         viewers.sort();
         let mut bytes = vec![5];
-        serde_json::to_writer(&mut bytes, &viewers)?;
-        if bytes.len() > MAX_VIEWER_LIST_BYTES {
-            return Ok(());
+        if serde_json::to_writer(&mut bytes, &viewers).is_ok()
+            && bytes.len() <= MAX_VIEWER_LIST_BYTES
+        {
+            self.write_control_only(peer, &bytes, true);
         }
-        self.send_profile_control(peer, &bytes).await
     }
-    async fn send_stream_info(&mut self, peer: &str) -> Result<()> {
+    fn write_stream_info_only(&mut self, peer: &str) {
         let info = self.inbox.lock().unwrap().own_stream_info;
-        if let Some(info) = info {
+        if let Some(info) = info
+            && let Ok(encoded) = serde_json::to_vec(&info)
+        {
             let mut bytes = vec![3];
-            bytes.extend_from_slice(&serde_json::to_vec(&info)?);
-            if let Some(rtc) = self.peers.get_mut(peer) {
-                let _ = rtc.send_control(&bytes)?;
-                let packets = rtc.drain()?.packets;
-                self.send_packets(packets).await;
-            }
+            bytes.extend_from_slice(&encoded);
+            self.write_control_only(peer, &bytes, true);
         }
-        Ok(())
     }
-    async fn send_preview(&mut self, peer: &str) -> Result<()> {
-        if let Some(jpeg) = &self.preview {
+    fn write_preview_only(&mut self, peer: &str) {
+        if let Some(jpeg) = self.preview.clone() {
             let mut bytes = Vec::with_capacity(jpeg.len() + 1);
             bytes.push(2);
-            bytes.extend_from_slice(jpeg);
-            if let Some(rtc) = self.peers.get_mut(peer) {
-                let _ = rtc.send_control(&bytes)?;
-                let out = rtc.drain()?;
-                self.send_packets(out.packets).await;
-            }
+            bytes.extend_from_slice(&jpeg);
+            self.write_control_only(peer, &bytes, false);
         }
-        Ok(())
+    }
+    async fn send_priority_control(&mut self, peer: &str, bytes: &[u8]) {
+        self.write_control_only(peer, bytes, true);
+        self.drain(peer).await;
+    }
+    async fn send_avatar_hash(&mut self, peer: &str) {
+        self.write_avatar_hash_only(peer);
+        self.drain(peer).await;
+    }
+    async fn send_watchers(&mut self, peer: &str) {
+        self.write_watchers_only(peer);
+        self.drain(peer).await;
+    }
+    async fn send_stream_info(&mut self, peer: &str) {
+        self.write_stream_info_only(peer);
+        self.drain(peer).await;
+    }
+    async fn send_preview(&mut self, peer: &str) {
+        self.write_preview_only(peer);
+        self.drain(peer).await;
     }
     async fn sound(&mut self, packet: AudioPacket) -> Result<()> {
         if !self.in_room || !self.members.iter().any(|m| m.id == self.local && m.sharing) {
@@ -1543,11 +1865,18 @@ impl CloudflareActor {
             if !self.viewers.contains(&peer) {
                 continue;
             }
-            self.peers
+            let write = self
+                .peers
                 .get_mut(&peer)
                 .unwrap()
-                .write_audio(packet.data.clone(), packet.micros)?;
-            self.drain(&peer).await?;
+                .write_audio(packet.data.clone(), packet.micros);
+            match write {
+                Ok(()) => self.drain(&peer).await,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "write_audio_failed");
+                    self.failed_peer(&peer, &format!("write audio: {error:#}"));
+                }
+            }
         }
         Ok(())
     }
@@ -1578,15 +1907,48 @@ impl CloudflareActor {
             if self.viewers_waiting.contains(&peer) {
                 continue;
             }
-            self.peers.get_mut(&peer).unwrap().write_codec(
-                frame.data.clone(),
-                frame.micros,
-                frame.codec,
-            )?;
-            self.drain(&peer).await?;
+            let rtc = self.peers.get_mut(&peer).unwrap();
+            if !rtc.supports_codec(frame.codec) {
+                tracing::debug!(%peer, codec = ?frame.codec, "peer_video_codec_unsupported_skipping");
+                continue;
+            }
+            match rtc.write_codec(frame.data.clone(), frame.micros, frame.codec) {
+                Ok(()) => self.drain(&peer).await,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "write_video_failed");
+                    self.failed_peer(&peer, &format!("write video: {error:#}"));
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn candidate_summary(candidates: &[IceCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|c| format!("{:?}:{}", c.kind(), c.addr()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sdp_candidate_summary(payload: &str) -> String {
+    let sdp = serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v["sdp"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    sdp.lines()
+        .filter_map(|line| line.strip_prefix("a=candidate:"))
+        .filter_map(|raw| {
+            let parts: Vec<_> = raw.split_whitespace().collect();
+            if parts.len() >= 8 {
+                Some(format!("{}:{}:{}", parts[7], parts[4], parts[5]))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // Extra SDP metadata is ignored by legacy peers and passed through the existing Worker.
@@ -1679,7 +2041,7 @@ mod recovery_tests {
                     .unwrap()
                     .receive(source, destination, &data)
                     .unwrap();
-                actor.drain(&peer).await.unwrap();
+                actor.drain(&peer).await;
             }
         }
     }
@@ -1807,9 +2169,17 @@ mod recovery_tests {
         let description = new.to_sdp_string();
         let mut candidates = a.candidates.clone();
         candidates.push(new);
-        a.apply_candidates(a.sockets.clone(), candidates.clone())
-            .await
-            .unwrap();
+        a.apply_candidates(
+            a.observed_interfaces.clone(),
+            a.sockets.clone(),
+            stun::GatherResult {
+                candidates: candidates.clone(),
+                symmetric_nat: false,
+                mappings: Default::default(),
+            },
+            false,
+        )
+        .await;
         let message: Value = serde_json::from_str(&signals.try_recv().unwrap()).unwrap();
         assert_eq!(message["kind"], "ice");
         let payload: Value = serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
@@ -1835,9 +2205,17 @@ mod recovery_tests {
         .await
         .unwrap();
         assert_eq!(b.recovery[&b_peer].remote_candidates.len(), 1);
-        a.apply_candidates(a.sockets.clone(), candidates)
-            .await
-            .unwrap();
+        a.apply_candidates(
+            a.observed_interfaces.clone(),
+            a.sockets.clone(),
+            stun::GatherResult {
+                candidates,
+                symmetric_nat: false,
+                mappings: Default::default(),
+            },
+            false,
+        )
+        .await;
         assert!(
             signals.try_recv().is_err(),
             "Unchanged mapping must not generate signaling traffic"

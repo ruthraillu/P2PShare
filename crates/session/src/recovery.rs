@@ -30,7 +30,9 @@ impl Recovery {
     }
     pub fn failed(&mut self, now: Instant) -> Duration {
         self.ready = false;
-        let delay = Duration::from_secs((2u64 << self.failures.min(4)).min(30));
+        // Keep max retry delay below HANDSHAKE_TIMEOUT (25s) so the answerer does not
+        // time out before the designated offerer retries.
+        let delay = Duration::from_secs((2u64 << self.failures.min(4)).min(20));
         if self.retry_at.is_none() {
             self.retry_at = Some(now + delay);
             self.failures = self.failures.saturating_add(1);
@@ -70,7 +72,7 @@ mod tests {
         let mut r = Recovery::new(now);
         assert!(!r.expired(now + Duration::from_secs(24)));
         assert!(r.expired(now + HANDSHAKE_TIMEOUT));
-        for seconds in [2, 4, 8, 16, 30, 30] {
+        for seconds in [2, 4, 8, 16, 20, 20] {
             let delay = r.failed(now);
             assert_eq!(delay, Duration::from_secs(seconds));
             assert!(!r.due(now));

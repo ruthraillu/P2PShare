@@ -13,13 +13,15 @@ use windows::{
 };
 pub struct GpuEncoder {
     encoder: Encoder,
-    graphics: GraphicsDevice,
+    _graphics: GraphicsDevice,
     video: ID3D11VideoDevice,
     context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     target: ID3D11Texture2D,
     output: ID3D11VideoProcessorOutputView,
+    input_texture: Option<ID3D11Texture2D>,
+    input_view: Option<ID3D11VideoProcessorInputView>,
     size: Dimensions,
     settings: StreamConfig,
     adapter: u32,
@@ -165,6 +167,7 @@ impl GpuEncoder {
                 0,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             );
+            context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&input_rect));
             context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&output_rect));
             context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&output_rect));
@@ -197,13 +200,15 @@ impl GpuEncoder {
                 encoder,
                 settings,
                 adapter,
-                graphics,
+                _graphics: graphics,
                 video,
                 context,
                 enumerator,
                 processor,
                 target,
                 output: output.unwrap(),
+                input_texture: None,
+                input_view: None,
                 size,
                 latency: LatencyMeter::new("gpu_convert_encode"),
             })
@@ -234,21 +239,27 @@ impl GpuEncoder {
     ) -> Result<Vec<Encoded>> {
         let started = std::time::Instant::now();
         unsafe {
-            let mut view = None;
-            self.video
-                .CreateVideoProcessorInputView(
-                    input,
-                    &self.enumerator,
-                    &D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                        ..Default::default()
-                    },
-                    Some(&mut view),
-                )
-                .context("Create GPU processor input view")?;
+            if self.input_texture.as_ref().map(Interface::as_raw) != Some(input.as_raw()) {
+                self.input_view = None;
+                self.input_texture = None;
+                let mut view = None;
+                self.video
+                    .CreateVideoProcessorInputView(
+                        input,
+                        &self.enumerator,
+                        &D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                            ..Default::default()
+                        },
+                        Some(&mut view),
+                    )
+                    .context("Create GPU processor input view")?;
+                self.input_view = view;
+                self.input_texture = Some(input.clone());
+            }
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
-                pInputSurface: ManuallyDrop::new(view),
+                pInputSurface: ManuallyDrop::new(self.input_view.clone()),
                 ..Default::default()
             };
             let result = self.context.VideoProcessorBlt(
@@ -259,7 +270,8 @@ impl GpuEncoder {
             );
             drop(ManuallyDrop::take(&mut stream.pInputSurface));
             result.context("BGRA to NV12 processor blit")?;
-            self.graphics.context.Flush();
+            // VideoProcessorBlt and ps_ff_encode's CopySubresourceRegion + Flush()
+            // execute sequentially on the same immediate context; no extra Flush needed.
         }
         let frames = self
             .encoder

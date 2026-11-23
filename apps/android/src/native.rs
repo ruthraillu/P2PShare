@@ -169,7 +169,35 @@ static FOREGROUND: AtomicBool = AtomicBool::new(true);
 static RESUME_EPOCH: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SESSION: OnceLock<Mutex<Option<std::sync::Weak<Session>>>> = OnceLock::new();
 static CONFIG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static EDITED_ROOM: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn read_config_string(path: &std::path::Path) -> std::io::Result<String> {
+    let _guard = CONFIG_LOCK.lock().unwrap();
+    std::fs::read_to_string(path)
+}
+
+fn write_config_atomic(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn update_config<T>(
+    f: impl FnOnce(&mut p2pshare_session::AppConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = CONFIG_LOCK.lock().unwrap();
+    let path = CONFIG_PATH
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Config unavailable"))?;
+    let mut config = p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
+    let out = f(&mut config)?;
+    let doc = config.document()?;
+    write_config_atomic(path, &doc)?;
+    Ok(out)
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeForeground(
     _env: JNIEnv,
@@ -180,6 +208,11 @@ pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeForeground(
     let was_active=FOREGROUND.swap(active, Ordering::AcqRel);
     if active && !was_active {
         RESUME_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+    if active != was_active
+        && let Some(ctx) = platform_input().lock().unwrap().repaint.clone()
+    {
+        ctx.request_repaint();
     }
     tracing::info!(active, "android_viewer_foreground_changed");
 }
@@ -216,12 +249,11 @@ pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeSaveConfig(
     let result = (|| -> anyhow::Result<()> {
         let text: String = env.get_string(&text)?.into();
         p2pshare_session::AppConfig::parse(&text)?;
-        std::fs::write(
-            CONFIG_PATH
-                .get()
-                .ok_or_else(|| anyhow::anyhow!("Config path unavailable"))?,
-            text,
-        )?;
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        let path = CONFIG_PATH
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Config path unavailable"))?;
+        write_config_atomic(path, &text)?;
         Ok(())
     })();
     match result {
@@ -260,6 +292,17 @@ impl Bridge {
     fn update_pip(&self, active: bool, width: u32, height: u32) {
         let _=self.env(|env| {env.call_method(self.activity.as_obj(),"updatePip","(ZII)V",&[JValue::Bool(active as u8),JValue::Int(width as i32),JValue::Int(height as i32)])?;Ok(())});
     }
+    fn set_keep_screen_on(&self, active: bool) {
+        let _ = self.env(|env| {
+            env.call_method(
+                self.activity.as_obj(),
+                "setKeepScreenOn",
+                "(Z)V",
+                &[JValue::Bool(active as u8)],
+            )?;
+            Ok(())
+        });
+    }
     fn enter_pip(&self) {
         let _=self.env(|env| {env.call_method(self.activity.as_obj(),"enterPip","()V",&[])?;Ok(())});
     }
@@ -289,7 +332,7 @@ impl Bridge {
     }
     fn edit_config(&self) {
         if let Some(path) = CONFIG_PATH.get()
-            && let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(text) = read_config_string(path)
         {
             let _ = self.env(|env| {
                 let text = env.new_string(text)?;
@@ -521,6 +564,13 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
     let _ = tracing::subscriber::set_global_default(subscriber);
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let bridge = Arc::new(Bridge::new(&app)?);
+        let _attachment = bridge.vm.attach_current_thread()?;
+        {
+            let mut platform = platform_input().lock().unwrap();
+            platform.back = false;
+            platform.pip = false;
+            platform.pip_closed = false;
+        }
         let identity = app
             .internal_data_path()
             .ok_or("Android data directory unavailable")?
@@ -593,7 +643,7 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
                 Ok(Box::new(AndroidUi {
                     profiles,
                     receiver,
-                    _audio: audio,
+                    audio,
                     room,
                     session,
                     bridge,
@@ -605,6 +655,8 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
                     available_update: None,
                     resume_epoch: RESUME_EPOCH.load(Ordering::Acquire),
                     preview_textures: HashMap::new(),
+                    last_pip: None,
+                    last_keep_screen_on: None,
                 }))
             }),
         );
@@ -706,7 +758,7 @@ struct AndroidUi {
     session: Arc<Session>,
     bridge: Arc<Bridge>,
     receiver: Receiver,
-    _audio: audio::AudioReceiver,
+    audio: audio::AudioReceiver,
     gpu: Gpu,
     diagnostics_at: std::time::Instant,
     report_data: std::path::PathBuf,
@@ -715,10 +767,23 @@ struct AndroidUi {
     available_update: Option<semver::Version>,
     resume_epoch: u64,
     preview_textures: HashMap<String, egui::TextureHandle>,
+    last_pip: Option<(bool, u32, u32)>,
+    last_keep_screen_on: Option<bool>,
+}
+impl AndroidUi {
+    fn diagnostics_page_open(&self) -> bool {
+        !self.room.pip_mode
+            && !self.room.is_fullscreen()
+            && !self.room.signaling_setup
+            && self.room.handles_back()
+            && self.room.snapshot.content_rect.is_none()
+            && self.room.snapshot.viewer_rect.is_none()
+    }
 }
 impl eframe::App for AndroidUi {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         use std::sync::mpsc::TryRecvError;
+        let diagnostics_open = self.diagnostics_page_open();
         let diagnostics = &mut self.room.diagnostic_panel;
         if let Some(upload) = &self.report_upload {
             let result = match upload.try_recv() {
@@ -732,12 +797,16 @@ impl eframe::App for AndroidUi {
                 self.report_upload = None;
             }
         }
-        if self.report_refresh.is_none_or(|last| last.elapsed().as_secs() >= 2) {
-            self.report_refresh = Some(std::time::Instant::now());
-            diagnostics.runs = crate::diagnostics::recent(&self.report_data);
-            diagnostics.configured = CONFIG_PATH.get().and_then(|path| std::fs::read_to_string(path).ok())
-                .and_then(|text| p2pshare_session::AppConfig::parse(&text).ok())
-                .is_some_and(|config| crate::diagnostics::upload_url(&config.signaling_url).is_ok());
+        if diagnostics_open {
+            if self.report_refresh.is_none_or(|last| last.elapsed().as_secs() >= 2) {
+                self.report_refresh = Some(std::time::Instant::now());
+                diagnostics.runs = crate::diagnostics::recent(&self.report_data);
+                diagnostics.configured = CONFIG_PATH.get().and_then(|path| read_config_string(path).ok())
+                    .and_then(|text| p2pshare_session::AppConfig::parse(&text).ok())
+                    .is_some_and(|config| crate::diagnostics::upload_url(&config.signaling_url).is_ok());
+            }
+        } else {
+            self.report_refresh = None;
         }
 
         {
@@ -759,7 +828,7 @@ impl eframe::App for AndroidUi {
         let epoch = RESUME_EPOCH.load(Ordering::Acquire);
         if epoch != self.resume_epoch {
             self.resume_epoch = epoch;
-            self.gpu.reconcile(&[], &self.bridge, frame);
+            self.gpu.reconcile(&[], &self.bridge, &self.session, frame);
             for peer in &mut self.room.participants {
                 if !peer.local {
                     peer.texture = None;
@@ -775,9 +844,10 @@ impl eframe::App for AndroidUi {
             self.room.room_name = room;
         }
         if let Some(name) = edited_name().lock().unwrap().take() {
-            if let Some(path) = CONFIG_PATH.get() {
-                let _ = p2pshare_session::AppConfig::save_username(path, &name);
-            }
+            let _ = update_config(|config| {
+                config.username = name.clone();
+                Ok(())
+            });
             self.room.name = name.clone();
             self.session.command(Command::Rename(name));
         }
@@ -786,19 +856,23 @@ impl eframe::App for AndroidUi {
         let state = self.session.snapshot();
         self.room.apply_snapshot(&room_state(&state));
         self.profiles.sync(&mut self.room,&self.session,ui.ctx(),&state);
-        let desired: Vec<_> = state
-            .members
-            .iter()
-            .filter(|m| m.sharing && m.id != state.local_id && self.session.is_watching(&m.id))
-            .map(|m| {
-                (
-                    m.id.clone(),
-                    Dimensions::new(m.width, m.height),
-                    self.session.video_codec(&m.id),
-                )
-            })
-            .collect();
-        self.gpu.reconcile(&desired, &self.bridge, frame);
+        let desired: Vec<_> = if FOREGROUND.load(Ordering::Acquire) {
+            state
+                .members
+                .iter()
+                .filter(|m| m.sharing && m.id != state.local_id && self.session.is_watching(&m.id))
+                .map(|m| {
+                    (
+                        m.id.clone(),
+                        Dimensions::new(m.width, m.height),
+                        self.session.video_codec(&m.id),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.gpu.reconcile(&desired, &self.bridge, &self.session, frame);
         self.preview_textures
             .retain(|id, _| state.members.iter().any(|m| &m.id == id && m.sharing));
         for (peer, bytes) in self.session.take_previews() {
@@ -879,7 +953,20 @@ impl eframe::App for AndroidUi {
             }
         }
         let pip_stream=self.room.playback_participant();
-        self.bridge.update_pip(pip_stream.is_some(),pip_stream.map(|p|p.size.width).unwrap_or(16),pip_stream.map(|p|p.size.height).unwrap_or(9));
+        let pip_state = (
+            pip_stream.is_some(),
+            pip_stream.map(|p| p.size.width).unwrap_or(16),
+            pip_stream.map(|p| p.size.height).unwrap_or(9),
+        );
+        if self.last_pip != Some(pip_state) {
+            self.last_pip = Some(pip_state);
+            self.bridge.update_pip(pip_state.0, pip_state.1, pip_state.2);
+        }
+        let keep_screen_on = pip_stream.is_some() || self.room.capture_running;
+        if self.last_keep_screen_on != Some(keep_screen_on) {
+            self.last_keep_screen_on = Some(keep_screen_on);
+            self.bridge.set_keep_screen_on(keep_screen_on);
+        }
         let actions = self.room.ui(ui);
         for action in actions {
             match action {
@@ -889,13 +976,13 @@ impl eframe::App for AndroidUi {
                     }
                 }
                 Action::SetLanguage(language)=>{
-                    let result=(||->anyhow::Result<()>{let path=CONFIG_PATH.get().ok_or_else(||anyhow::anyhow!("Config unavailable"))?;let mut config=p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;config.language=Some(language);let pending=path.with_extension("toml.pending");std::fs::write(&pending,config.document()?)?;std::fs::rename(pending,path)?;Ok(())})();
+                    let result=update_config(|config|{config.language=Some(language);Ok(())});
                     if let Err(error)=result{self.room.language_prompt=true;self.room.status=format!("Could not save language: {error}");}
                     else{let _=self.bridge.env(|env|{let code=env.new_string(language.code())?;env.call_method(self.bridge.activity.as_obj(),"setUiLanguage","(Ljava/lang/String;)V",&[JValue::Object(code.as_ref())])?;Ok(())});}
                 },
                 Action::ChooseAvatar=>{let _=self.bridge.env(|env|{env.call_method(self.bridge.activity.as_obj(),"chooseAvatar","()V",&[])?;Ok(())});},
-                Action::SaveAvatar(bytes)=>{self.room.profiles.error=self.profiles.save(Some(bytes),&self.session).err().map(|e|e.to_string()).unwrap_or_default();},
-                Action::RemoveAvatar=>{self.room.profiles.error=self.profiles.save(None,&self.session).err().map(|e|e.to_string()).unwrap_or_default();},
+                Action::SaveAvatar(bytes)=>{let _guard=CONFIG_LOCK.lock().unwrap();self.room.profiles.error=self.profiles.save(Some(bytes),&self.session).err().map(|e|e.to_string()).unwrap_or_default();},
+                Action::RemoveAvatar=>{let _guard=CONFIG_LOCK.lock().unwrap();self.room.profiles.error=self.profiles.save(None,&self.session).err().map(|e|e.to_string()).unwrap_or_default();},
                 Action::Watch {
                     participant,
                     enabled,
@@ -932,7 +1019,7 @@ impl eframe::App for AndroidUi {
                     std::thread::spawn(move || {
                         let result = (|| -> anyhow::Result<_> {
                             let path = CONFIG_PATH.get().ok_or_else(|| anyhow::anyhow!("Configuration unavailable"))?;
-                            let config = p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
+                            let config = p2pshare_session::AppConfig::parse(&read_config_string(path)?)?;
                             crate::diagnostics::send(&data, &config.signaling_url, &id)
                         })().map_err(|error| format!("{error:#}"));
                         let _ = tx.send(result);
@@ -966,16 +1053,11 @@ impl eframe::App for AndroidUi {
                     }
                 }
                 Action::NamedRoom { room, name } => {
-                    let result = (|| -> anyhow::Result<()> {
-                        let path = CONFIG_PATH.get().ok_or_else(|| anyhow::anyhow!("Config unavailable"))?;
-                        let mut config = p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
+                    let result = update_config(|config| {
                         config.room_name = room.trim().to_owned();
                         config.username = name.trim().to_owned();
-                        let temporary = path.with_extension("toml.tmp");
-                        std::fs::write(&temporary, config.document()?)?;
-                        std::fs::rename(temporary, path)?;
                         Ok(())
-                    })();
+                    });
                     if let Err(error) = result {
                         self.room.signaling_setup_error = error.to_string();
                         continue;
@@ -987,37 +1069,42 @@ impl eframe::App for AndroidUi {
                 Action::EditRoom(room) => self.bridge.edit_room(&room),
                 Action::PictureInPicture => self.bridge.enter_pip(),
                 Action::ConfigureSignaling(url) => {
-                    let result = (|| -> anyhow::Result<String> {
-                        let path = CONFIG_PATH.get().ok_or_else(|| anyhow::anyhow!("Config unavailable"))?;
-                        let mut config = p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
+                    let result = update_config(|config| {
                         config.set_signaling_url(&url)?;
-                        let temporary = path.with_extension("toml.tmp");
-                        std::fs::write(&temporary, config.document()?)?;
-                        std::fs::rename(temporary, path)?;
-                        Ok(config.signaling_url)
-                    })();
+                        Ok(config.signaling_url.clone())
+                    });
                     match result {
                         Ok(url) => {
                             self.session.command(Command::SetSignalingServer(url.clone()));
                             self.room.signaling_server = url;
                             self.room.signaling_setup = false;
                             self.room.signaling_setup_error.clear();
+                            self.report_refresh = None;
                         }
                         Err(error) => self.room.signaling_setup_error = error.to_string(),
                     }
                 }
                 Action::SaveMobilePreferences { buffer_ms, server } => {
                     let result=(|| -> anyhow::Result<()> {
-                        let path=CONFIG_PATH.get().ok_or_else(||anyhow::anyhow!("Config unavailable"))?;
-                        let mut config=p2pshare_session::AppConfig::parse(&std::fs::read_to_string(path)?)?;
-                        config.username=self.room.name.clone();config.room_name=self.room.room_name.clone();config.logging_enabled=self.room.logging_enabled;
-                        config.playback.buffer_ms=buffer_ms;config.set_signaling_url(&server)?;
-                        config.validate()?;let temporary=path.with_extension("toml.tmp");std::fs::write(&temporary,config.document()?)?;std::fs::rename(temporary,path)?;
-                        self.session.set_playback_config(config.playback)?;Ok(())
+                        let playback = update_config(|config| {
+                            config.username=self.room.name.clone();
+                            config.room_name=self.room.room_name.clone();
+                            config.logging_enabled=self.room.logging_enabled;
+                            config.playback.buffer_ms=buffer_ms;
+                            config.set_signaling_url(&server)?;
+                            config.validate()?;
+                            Ok(config.playback)
+                        })?;
+                        self.session.set_playback_config(playback)?;
+                        Ok(())
                     })();
+                    if result.is_ok() { self.report_refresh = None; }
                     self.room.status=match result {Ok(())=>"Saved. Restart to apply signaling server changes.".into(),Err(e)=>format!("Settings not saved: {e:#}")};
                 }
-                Action::EditConfig => self.bridge.edit_config(),
+                Action::EditConfig => {
+                    self.report_refresh = None;
+                    self.bridge.edit_config();
+                }
                 Action::JoinRoom { invite, name } => {
                     if let Ok(parsed) = p2pshare_session::CloudflareInvite::parse(&invite)
                         && let Some(room) = parsed.room
@@ -1030,9 +1117,10 @@ impl eframe::App for AndroidUi {
                 Action::LeaveRoom => {let _=self.bridge.env(|env|{env.call_method(self.bridge.activity.as_obj(),"stopScreenShare","()V",&[])?;Ok(())});self.session.command(Command::Leave);},
                 Action::EditName(name) => self.bridge.edit_name(&name),
                 Action::Rename(name) => {
-                    if let Some(path) = CONFIG_PATH.get() {
-                        let _ = p2pshare_session::AppConfig::save_username(path, &name);
-                    }
+                    let _ = update_config(|config| {
+                        config.username = name.clone();
+                        Ok(())
+                    });
                     self.session.command(Command::Rename(name));
                 }
                 Action::CopyInvite(text) => self.bridge.copy(&text),
@@ -1042,7 +1130,9 @@ impl eframe::App for AndroidUi {
                 Action::RefreshSources => {}
             }
         }
-        if state.in_room && !desired.is_empty() {
+        if (state.in_room && !desired.is_empty())
+            || (self.diagnostics_page_open() && self.report_refresh.is_none())
+        {
             // EGL vsync supplies the pacing. Waiting another 16 ms after a swap
             // can miss the next refresh and reduce a 60 Hz viewer to ~30 FPS.
             ui.ctx().request_repaint();
@@ -1053,6 +1143,9 @@ impl eframe::App for AndroidUi {
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         let _=self.bridge.env(|env|{env.call_method(self.bridge.activity.as_obj(),"stopScreenShare","()V",&[])?;Ok(())});
         self.receiver.stop();
+        self.audio.stop();
+        self.bridge.close_audio();
+        self.bridge.set_keep_screen_on(false);
         self.bridge.keep_alive(false);
         platform_input().lock().unwrap().repaint = None;
         self.bridge.viewer_mode(false, false);
@@ -1123,6 +1216,7 @@ impl Gpu {
         &mut self,
         desired: &[(String, Dimensions, VideoFormat)],
         bridge: &Bridge,
+        session: &Session,
         frame: &mut Frame,
     ) {
         for slot in &mut self.slots {
@@ -1241,6 +1335,7 @@ impl Gpu {
                 slot.size = *size;
                 slot.codec = *codec;
                 self.failures.remove(peer);
+                session.command(Command::RequestKeyframe(peer.clone()));
             } else {
                 self.failures
                     .insert(peer.clone(), std::time::Instant::now());

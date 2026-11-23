@@ -95,11 +95,17 @@ fn dispatch(pending: &Pending, source: SocketAddr, bytes: &[u8]) -> bool {
     true
 }
 pub(super) fn interfaces(isolated: bool) -> Result<Vec<std::net::IpAddr>> {
-    Ok(network::select(
+    let defaults = if isolated {
+        Vec::new()
+    } else {
+        network::default_route_ips()
+    };
+    Ok(network::select_with_defaults(
         if_addrs::get_if_addrs()?
             .into_iter()
             .map(|i| i.ip())
             .collect(),
+        &defaults,
         isolated,
     ))
 }
@@ -218,7 +224,20 @@ async fn servers() -> Vec<SocketAddr> {
     }
     result
 }
-pub(super) async fn gather(sockets: &Sockets) -> Vec<IceCandidate> {
+pub(super) struct GatherResult {
+    pub candidates: Vec<IceCandidate>,
+    pub symmetric_nat: bool,
+    pub mappings: std::collections::HashSet<(SocketAddr, SocketAddr)>,
+}
+pub(super) struct Opened {
+    pub ips: Vec<std::net::IpAddr>,
+    pub sockets: Sockets,
+    pub gather: GatherResult,
+}
+pub(super) async fn gather(
+    sockets: &Sockets,
+    known: &std::collections::HashSet<(SocketAddr, SocketAddr)>,
+) -> GatherResult {
     let mut candidates = Vec::new();
     let mut addresses: Vec<_> = sockets.keys().copied().collect();
     addresses.sort_by_key(|a| (network::rank(&a.ip()), *a));
@@ -227,63 +246,113 @@ pub(super) async fn gather(sockets: &Sockets) -> Vec<IceCandidate> {
             candidates.push(candidate);
         }
     }
+    let host_count = candidates.len();
     if !sockets.keys().any(|a| a.is_ipv4() && !a.ip().is_loopback()) {
-        return candidates;
+        return GatherResult {
+            candidates,
+            symmetric_nat: false,
+            mappings: Default::default(),
+        };
     }
     let servers = servers().await;
     let servers = &servers;
-    let results = futures_util::future::join_all(sockets.iter().filter(|(a,_)|a.is_ipv4()&&!a.ip().is_loopback()).map(|(base,socket)|async move {
-        let mut mapped = Vec::new();
-        for (server,result) in futures_util::future::join_all(servers.iter().map(|server|async {(*server,socket.query(*server).await)})).await {
-            match result {
-                Ok(public) => {
-                    tracing::info!(local=%base,%server,%public,"stun_binding_discovered");
-                    if !mapped.contains(&public) {mapped.push(public);}
+    let results = futures_util::future::join_all(
+        sockets
+            .iter()
+            .filter(|(a, _)| a.is_ipv4() && !a.ip().is_loopback())
+            .map(|(base, socket)| async move {
+                let mut mapped = Vec::new();
+                for (server, result) in futures_util::future::join_all(
+                    servers
+                        .iter()
+                        .map(|server| async { (*server, socket.query(*server).await) }),
+                )
+                .await
+                {
+                    match result {
+                        Ok(public) => {
+                            if !known.contains(&(*base, public)) {
+                                tracing::info!(local = %base, %server, %public, "stun_binding_discovered");
+                            } else {
+                                tracing::debug!(local = %base, %server, %public, "stun_binding_unchanged");
+                            }
+                            if !mapped.contains(&public) {
+                                mapped.push(public);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(local = %base, %server, %error, "stun_binding_failed")
+                        }
+                    }
                 }
-                Err(error) => tracing::warn!(local=%base,%server,%error,"stun_binding_failed"),
-            }
-        }
-        if mapped.len()>1 {tracing::warn!(local=%base,mappings=mapped.len(),"stun_mapping_varies_by_server_direct_connection_may_need_relay");}
-        (*base,mapped)
-    })).await;
+                if mapped.len() > 1 {
+                    tracing::warn!(
+                        local = %base,
+                        mappings = mapped.len(),
+                        "stun_mapping_varies_by_server_direct_connection_may_need_relay"
+                    );
+                }
+                (*base, mapped)
+            }),
+    )
+    .await;
+    let mut symmetric_nat = false;
+    let mut mappings = std::collections::HashSet::new();
     for (base, mapped) in results {
+        if mapped.len() > 1 {
+            symmetric_nat = true;
+        }
         for public in mapped {
+            mappings.insert((base, public));
             if let Ok(c) = p2pshare_rtc::reflexive_candidate(public, base) {
                 candidates.push(c);
             }
         }
     }
     tracing::info!(
-        host = sockets.len(),
-        reflexive = candidates.len() - sockets.len(),
+        host = host_count,
+        reflexive = candidates.len().saturating_sub(host_count),
+        symmetric_nat,
         "media_candidate_discovery_complete"
     );
-    candidates
+    GatherResult {
+        candidates,
+        symmetric_nat,
+        mappings,
+    }
 }
-pub(super) async fn open(
+pub(super) async fn open_with_ips(
+    ips: Vec<std::net::IpAddr>,
     events: mpsc::Sender<Internal>,
-    isolated: bool,
-) -> Result<(Sockets, Vec<IceCandidate>)> {
-    let ips = interfaces(isolated)?;
+) -> Result<Opened> {
     tracing::info!(
         ipv6 = ips.iter().filter(|a| a.is_ipv6()).count(),
         ipv4 = ips.iter().filter(|a| a.is_ipv4()).count(),
         "media_interfaces_ipv6_preferred"
     );
     let mut sockets = HashMap::new();
-    for ip in ips {
+    for &ip in &ips {
         match bind(ip, events.clone()).await {
             Ok((addr, socket)) => {
                 sockets.insert(addr, socket);
             }
-            Err(error) => tracing::warn!(%ip,%error,"media_interface_bind_failed"),
+            Err(error) => tracing::warn!(%ip, %error, "media_interface_bind_failed"),
         }
     }
     if sockets.is_empty() {
         bail!("No usable network interface");
     }
-    let candidates = gather(&sockets).await;
-    Ok((sockets, candidates))
+    let empty = std::collections::HashSet::new();
+    let gather = gather(&sockets, &empty).await;
+    Ok(Opened {
+        ips,
+        sockets,
+        gather,
+    })
+}
+pub(super) async fn open(events: mpsc::Sender<Internal>, isolated: bool) -> Result<Opened> {
+    let ips = interfaces(isolated)?;
+    open_with_ips(ips, events).await
 }
 #[cfg(test)]
 mod tests {

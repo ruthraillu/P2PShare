@@ -1,5 +1,5 @@
 //! Safe owned wrappers around the pinned FFmpeg shim; no UI/network dependencies.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use p2pshare_media::{
     Dimensions,
     config::{StreamConfig, VideoFormat},
@@ -404,11 +404,24 @@ impl std::ops::Deref for RgbaBuffer {
 }
 impl Drop for RgbaBuffer {
     fn drop(&mut self) {
-        if let Some(pool) = &self.pool {
-            let mut pool = pool.lock().unwrap();
-            if pool.len() < 3 {
-                pool.push(std::mem::take(&mut self.bytes));
-            }
+        if let Some(pool) = &self.pool
+            && let Ok(mut pool) = pool.lock()
+            && pool.len() < 3
+        {
+            pool.push(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+const AVERROR_INVALIDDATA: i32 = -1094995529;
+pub(crate) enum DecodeError {
+    Bitstream(anyhow::Error),
+    HardwareFallback(anyhow::Error),
+    Other(anyhow::Error),
+}
+impl DecodeError {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Bitstream(error) | Self::HardwareFallback(error) | Self::Other(error) => error,
         }
     }
 }
@@ -518,16 +531,18 @@ impl Decoder {
     }
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<crate::DecodedFrame>> {
         self.decode_for_display(data, true)
+            .map_err(DecodeError::into_anyhow)
     }
     pub(crate) fn decode_for_display(
         &mut self,
         data: &[u8],
         display: bool,
-    ) -> Result<Option<crate::DecodedFrame>> {
-        ensure!(
-            !data.is_empty() && data.len() <= 2 * 1024 * 1024,
-            "Invalid compressed video size"
-        );
+    ) -> std::result::Result<Option<crate::DecodedFrame>, DecodeError> {
+        if data.is_empty() || data.len() > 2 * 1024 * 1024 {
+            return Err(DecodeError::Bitstream(anyhow::anyhow!(
+                "Invalid compressed video size"
+            )));
+        }
         let mut error = [0; 512];
         let code = unsafe {
             ps_ff_decode(
@@ -539,11 +554,14 @@ impl Decoder {
             )
         };
         report_diagnostics();
-        ensure!(code >= 0, "Decode: {}", text(&error));
-        let mut rgba = RgbaBuffer {
-            bytes: self.buffers.lock().unwrap().pop().unwrap_or_default(),
-            pool: Some(self.buffers.clone()),
-        };
+        if code < 0 {
+            let err = anyhow::anyhow!("Decode: {}", text(&error));
+            return Err(if code == AVERROR_INVALIDDATA {
+                DecodeError::Bitstream(err)
+            } else {
+                DecodeError::Other(err)
+            });
+        }
         let (mut w, mut h, mut hardware, mut lease) = (0, 0, 0, std::ptr::null_mut());
         let code = unsafe {
             ps_ff_frame(
@@ -558,7 +576,12 @@ impl Decoder {
             )
         };
         if code < 0 {
-            bail!("Decode: {}", text(&error));
+            let err = anyhow::anyhow!("Decode: {}", text(&error));
+            return Err(if code == AVERROR_INVALIDDATA {
+                DecodeError::Bitstream(err)
+            } else {
+                DecodeError::Other(err)
+            });
         }
         if code == 0 || code == 2 {
             return Ok(None);
@@ -568,15 +591,24 @@ impl Decoder {
                 codec = self.format.label(),
                 "hardware_decoder_produced_software_frame_reopen_with_cpu_threads"
             );
-            bail!(
+            return Err(DecodeError::HardwareFallback(anyhow::anyhow!(
                 "Hardware decoder fell back internally to software; reopen with software thread settings"
-            );
+            )));
         }
-        if code == 3 {
+        let rgba = if code == 3 {
             if self.gpu_output && hardware != 0 {
                 tracing::warn!(reason = text(&error), "gpu_presentation_fallback");
                 self.gpu_output = false;
             }
+            let mut rgba = RgbaBuffer {
+                bytes: self
+                    .buffers
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.pop())
+                    .unwrap_or_default(),
+                pool: Some(self.buffers.clone()),
+            };
             rgba.bytes.resize(w as usize * h as usize * 4, 0);
             let code = unsafe {
                 ps_ff_rgba(
@@ -587,8 +619,17 @@ impl Decoder {
                     512,
                 )
             };
-            ensure!(code >= 0, "Decode conversion: {}", text(&error));
-        }
+            if code < 0 {
+                return Err(DecodeError::Other(anyhow::anyhow!(
+                    "Decode conversion: {}",
+                    text(&error)
+                )));
+            }
+            rgba.bytes.truncate(w as usize * h as usize * 4);
+            rgba
+        } else {
+            RgbaBuffer::default()
+        };
         if self.hardware != (hardware != 0) {
             tracing::info!(
                 codec = self.format.label(),
@@ -598,11 +639,6 @@ impl Decoder {
         }
         self.hardware = hardware != 0;
         let gpu = (!lease.is_null()).then_some(GpuDecodedFrame { lease });
-        if gpu.is_some() {
-            rgba.bytes.clear();
-        } else {
-            rgba.bytes.truncate(w as usize * h as usize * 4);
-        }
         if !self.reported_output {
             tracing::info!(
                 codec = self.format.label(),
@@ -887,7 +923,10 @@ mod tests {
             for packet in encoder.submit(Some(&pixels), None, n * 16667, n == 0)? {
                 if n % 3 == 1 {
                     ensure!(
-                        decoder.decode_for_display(&packet.bytes, false)?.is_none(),
+                        decoder
+                            .decode_for_display(&packet.bytes, false)
+                            .map_err(DecodeError::into_anyhow)?
+                            .is_none(),
                         "Obsolete frame was converted"
                     );
                 } else {

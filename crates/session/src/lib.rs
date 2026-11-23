@@ -187,7 +187,7 @@ impl VideoInbox {
         let queue = self.audio.entry(packet.peer.clone()).or_default();
         if queue.len() >= if self.playback_ms == 0 { 12 } else { 120 } {
             queue.pop_front();
-            tracing::warn!("audio_receive_queue_overflow");
+            tracing::warn!(peer = %packet.peer, "audio_receive_queue_overflow");
         }
         queue.push_back(packet);
     }
@@ -241,6 +241,7 @@ impl VideoInbox {
         let mut request = !contiguous;
         if (full || !contiguous) && p2pshare_media::diagnostics::enabled() {
             tracing::warn!(
+                peer,
                 queue_frames = queue.len(),
                 queue_bytes = *bytes,
                 full,
@@ -417,14 +418,19 @@ impl Session {
         })
     }
     pub fn command(&self, command: Command) {
-        if matches!(
+        let sets_busy = matches!(
             &command,
             Command::Create(_) | Command::Join { .. } | Command::NamedRoom { .. }
-        ) {
+        );
+        if sets_busy {
             self.state.lock().unwrap().busy = true;
         }
         if self.commands.try_send(command).is_err() {
-            self.state.lock().unwrap().status = "Connection worker is busy; try again".into();
+            let mut state = self.state.lock().unwrap();
+            if sets_busy {
+                state.busy = false;
+            }
+            state.status = "Connection worker is busy; try again".into();
         }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -520,17 +526,25 @@ impl Session {
         if let Some(info) = changed {
             self.command(Command::StreamInfo(info));
         }
-        if frame.data.len() <= 2 * 1024 * 1024 {
-            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-            if self
-                .frames
-                .try_send(PublishedFrame { frame, sequence })
-                .is_err()
-            {
-                tracing::warn!("publisher_queue_frame_dropped");
-                self.publish_drops.fetch_add(1, Ordering::Relaxed);
-                self.keyframe.store(true, Ordering::Relaxed);
-            }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        if frame.data.len() > 2 * 1024 * 1024 {
+            tracing::warn!(
+                bytes = frame.data.len(),
+                keyframe = frame.keyframe,
+                "publisher_oversized_frame_dropped"
+            );
+            self.publish_drops.fetch_add(1, Ordering::Relaxed);
+            self.keyframe.store(true, Ordering::Relaxed);
+            return;
+        }
+        if self
+            .frames
+            .try_send(PublishedFrame { frame, sequence })
+            .is_err()
+        {
+            tracing::warn!("publisher_queue_frame_dropped");
+            self.publish_drops.fetch_add(1, Ordering::Relaxed);
+            self.keyframe.store(true, Ordering::Relaxed);
         }
     }
     pub fn media_micros(&self) -> u64 {
@@ -871,7 +885,8 @@ impl Actor {
                 });
             }
         });
-        let (sockets, candidates) = media_sockets(events.clone(), isolated).await?;
+        let opened = media_sockets(events.clone(), isolated).await?;
+        let (sockets, candidates) = (opened.sockets, opened.gather.candidates);
         {
             let mut s = state.lock().unwrap();
             s.saved_invite = std::fs::read(&room_file)
@@ -1513,16 +1528,20 @@ impl Actor {
                     self.reject(connection, send, recv, "Room is full (6 devices)");
                     return Ok(());
                 }
-                control::send(
-                    &mut send,
-                    &Wire::MeshWelcome {
-                        room,
-                        member: self.current_member(),
-                        address: self.endpoint.addr(),
-                        contacts: self.live_contacts(),
-                    },
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control::send(
+                        &mut send,
+                        &Wire::MeshWelcome {
+                            room,
+                            member: self.current_member(),
+                            address: self.endpoint.addr(),
+                            contacts: self.live_contacts(),
+                        },
+                    ),
                 )
-                .await?;
+                .await
+                .context("Timed out sending mesh welcome")??;
                 self.remember(Presence::new(address));
                 self.members.push(member);
                 self.add_link(connection, send, recv);
@@ -1562,27 +1581,28 @@ impl Actor {
                 self.mesh_connected().await?;
             }
             Internal::MeshFailed(generation, peer, attempted_address, error) => {
-                if generation == self.generation
-                    && self.mesh.is_some()
-                    && !self.links.contains_key(&peer)
-                    && self
-                        .contacts
-                        .get(&peer)
-                        .is_some_and(|p| p.address == attempted_address)
-                {
+                if generation == self.generation {
                     self.dialing.remove(&peer);
-                    let failures = self.retry_failures.entry(peer.clone()).or_default();
-                    let delay = 1u64 << (*failures).min(3);
-                    *failures = failures.saturating_add(1);
-                    tracing::info!(peer=%peer,retry_ms=delay*1000,%error,"peer_connect_retry");
-                    self.retry_after
-                        .insert(peer, Instant::now() + Duration::from_secs(delay));
-                    if self.links.is_empty() {
-                        self.status(if error.contains("Room is full") {
-                            "Room is full (6 devices) • waiting for a place".into()
-                        } else {
-                            "Room ready • waiting for peers to connect".into()
-                        });
+                    if self.mesh.is_some()
+                        && !self.links.contains_key(&peer)
+                        && self
+                            .contacts
+                            .get(&peer)
+                            .is_some_and(|p| p.address == attempted_address)
+                    {
+                        let failures = self.retry_failures.entry(peer.clone()).or_default();
+                        let delay = 1u64 << (*failures).min(3);
+                        *failures = failures.saturating_add(1);
+                        tracing::info!(peer=%peer,retry_ms=delay*1000,%error,"peer_connect_retry");
+                        self.retry_after
+                            .insert(peer, Instant::now() + Duration::from_secs(delay));
+                        if self.links.is_empty() {
+                            self.status(if error.contains("Room is full") {
+                                "Room is full (6 devices) • waiting for a place".into()
+                            } else {
+                                "Room ready • waiting for peers to connect".into()
+                            });
+                        }
                     }
                 }
             }
@@ -1608,20 +1628,27 @@ impl Actor {
                     self.reject(connection, send, recv, error);
                     return Ok(());
                 }
-                self.members.push(Member {
+                let member = Member {
                     id: peer,
                     name: clean_name(&name),
                     sharing: false,
                     width: 0,
                     height: 0,
-                });
-                control::send(
-                    &mut send,
-                    &Wire::Welcome {
-                        members: self.members.clone(),
-                    },
+                };
+                let mut welcome_members = self.members.clone();
+                welcome_members.push(member.clone());
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control::send(
+                        &mut send,
+                        &Wire::Welcome {
+                            members: welcome_members,
+                        },
+                    ),
                 )
-                .await?;
+                .await
+                .context("Timed out sending room welcome")??;
+                self.members.push(member);
                 self.add_link(connection, send, recv);
                 self.roster().await?;
             }
@@ -1833,28 +1860,24 @@ impl Actor {
         }
         self.peers
             .retain(|p, _| self.members.iter().any(|m| &m.id == p));
-        self.inbox
-            .lock()
-            .unwrap()
-            .queues
-            .retain(|p, _| self.members.iter().any(|m| &m.id == p && m.sharing));
-        self.inbox
-            .lock()
-            .unwrap()
-            .waiting
-            .retain(|p, _| self.members.iter().any(|m| &m.id == p && m.sharing));
-        self.inbox
-            .lock()
-            .unwrap()
-            .bytes
-            .retain(|p, _| self.members.iter().any(|m| &m.id == p && m.sharing));
+        {
+            let mut inbox = self.inbox.lock().unwrap();
+            let live = |p: &String| self.members.iter().any(|m| &m.id == p && m.sharing);
+            inbox.queues.retain(|p, _| live(p));
+            inbox.audio.retain(|p, _| live(p));
+            inbox.waiting.retain(|p, _| live(p));
+            inbox.bytes.retain(|p, _| live(p));
+            inbox.codecs.retain(|p, _| live(p));
+            inbox.timelines.retain(|p, _| live(p));
+        }
         self.requests
             .retain(|p, _| self.members.iter().any(|m| &m.id == p));
         for member in self.members.clone() {
             if member.id == self.local || self.peers.contains_key(&member.id) {
                 continue;
             }
-            let rtc = PeerRtc::new(&self.candidates)?;
+            let mut rtc = PeerRtc::new(&self.candidates)?;
+            rtc.set_peer_label(member.id.clone());
             self.peers.insert(member.id.clone(), rtc);
             self.drain(&member.id).await?;
             if self.local < member.id {
@@ -1874,29 +1897,42 @@ impl Actor {
             .collect();
         Ok(())
     }
-    async fn send_packets(&self, packets: Vec<(SocketAddr, SocketAddr, Vec<u8>)>) {
+    async fn send_packets(&self, peer: &str, packets: Vec<(SocketAddr, SocketAddr, Vec<u8>)>) {
         for (n, (source, destination, bytes)) in packets.into_iter().enumerate() {
-            if let Some(socket) = self.sockets.get(&source) {
-                // send_to waits for writable readiness instead of silently losing
-                // fragments of a large IDR when the kernel send buffer is busy.
-                match tokio::time::timeout(
-                    Duration::from_millis(20),
-                    socket.send_to(&bytes, destination),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "Video UDP send failed"),
-                    Err(_) => tracing::warn!("Video UDP send stalled for 20 ms"),
+            let Some(socket) = self.sockets.get(&source) else {
+                tracing::warn!(
+                    peer,
+                    %source,
+                    %destination,
+                    bytes = bytes.len(),
+                    "media_udp_source_socket_missing"
+                );
+                continue;
+            };
+            match socket.try_send_to(&bytes, destination) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match tokio::time::timeout(
+                        Duration::from_millis(2),
+                        socket.send_to(&bytes, destination),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(peer, %source, %destination, %error, "Video UDP send failed")
+                        }
+                        Err(_) => {
+                            tracing::warn!(peer, %source, %destination, "Video UDP send stalled for 2 ms")
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(peer, %source, %destination, %error, "Video UDP send failed")
                 }
             }
             // This runtime also receives RTP/RTX. Large IDRs must not starve it.
-            if n % 64 == 63 {
-                // Socket/AP queues can drop a giant IDR even when send_to
-                // succeeds. Break it into short bursts, allowing UDP receive
-                // and retransmission tasks to run between them.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            } else if n % 16 == 15 {
+            if n % 32 == 31 {
                 tokio::task::yield_now().await;
             }
         }
@@ -1907,7 +1943,7 @@ impl Actor {
             .get_mut(peer)
             .context("Missing media peer")?
             .drain()?;
-        self.send_packets(out.packets).await;
+        self.send_packets(peer, out.packets).await;
 
         for event in out.events {
             match event {
@@ -1971,6 +2007,7 @@ impl Actor {
                     );
                     if p2pshare_media::diagnostics::enabled() && (keyframe || !contiguous) {
                         tracing::info!(
+                            peer,
                             assembly_ms = received_at.elapsed().as_secs_f64() * 1000.,
                             keyframe,
                             contiguous,
@@ -1987,7 +2024,7 @@ impl Actor {
                         self.peers.get_mut(peer).unwrap().request_keyframe()?;
                         // Drain the feedback mutation before the next actor operation.
                         let feedback = self.peers.get_mut(peer).unwrap().drain()?;
-                        self.send_packets(feedback.packets).await;
+                        self.send_packets(peer, feedback.packets).await;
                     }
                 }
             }
@@ -2112,7 +2149,7 @@ fn validate_members(members: &[Member], local: &str, limit: Option<usize>) -> Re
 async fn media_sockets(
     events: mpsc::Sender<Internal>,
     isolated: bool,
-) -> Result<(stun::Sockets, Vec<IceCandidate>)> {
+) -> Result<stun::Opened> {
     stun::open(events, isolated).await
 }
 

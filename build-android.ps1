@@ -74,7 +74,7 @@ try {
  $javaSources=@(Get-ChildItem -LiteralPath (Join-Path $taskRoot 'apps\android\java') -Filter '*.java' -Recurse | ForEach-Object FullName)
  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\javac.exe') (@('-encoding','UTF-8','-source','8','-target','8','-classpath',$androidJar,'-d',$classes)+$javaSources)
  $classFiles=@(Get-ChildItem -LiteralPath $classes -Filter '*.class' -Recurse | ForEach-Object FullName)
- Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') (@('-cp',(Join-Path $buildTools 'lib\d8.jar'),'com.android.tools.r8.D8','--min-api','26','--lib',$androidJar,'--output',$dex)+$classFiles)
+ Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') (@('-cp',(Join-Path $buildTools 'lib\d8.jar'),'com.android.tools.r8.D8','--release','--min-api','26','--lib',$androidJar,'--output',$dex)+$classFiles)
  Add-Type -AssemblyName System.IO.Compression
  $stream=[IO.File]::Open($unsigned,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite)
  $zip=[IO.Compression.ZipArchive]::new($stream,[IO.Compression.ZipArchiveMode]::Update)
@@ -92,16 +92,30 @@ try {
   try { $source.CopyTo($dest) } finally { $source.Dispose(); $dest.Dispose() }
  } finally { $zip.Dispose(); $stream.Dispose() }
  Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-P','16','-f','4',$unsigned,$aligned)
- if ($SigningKey) {
-  if (!(Test-Path -LiteralPath $SigningKey -PathType Leaf)) { throw 'Android signing keystore was not found.' }
-  $key = (Get-Item -LiteralPath $SigningKey).FullName
- } else {
-  $key=Join-Path $artifacts 'test-signing.p12'
-  if (!(Test-Path $key)) {
-   Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\keytool.exe') @('-genkeypair','-keystore',$key,'-storetype','PKCS12','-storepass','p2pshare-test','-alias','p2pshare-test','-keyalg','RSA','-keysize','2048','-validity','3650','-dname','CN=P2PShare Local Test')
+ $ksPassWasSet = Test-Path Env:P2PSHARE_ANDROID_KEYSTORE_PASS
+ $ksPassOriginal = $env:P2PSHARE_ANDROID_KEYSTORE_PASS
+ $ksAlias = if ($env:P2PSHARE_ANDROID_KEY_ALIAS) { $env:P2PSHARE_ANDROID_KEY_ALIAS } else { 'p2pshare-test' }
+ if (!$env:P2PSHARE_ANDROID_KEYSTORE_PASS) {
+  $env:P2PSHARE_ANDROID_KEYSTORE_PASS = 'p2pshare-test'
+ }
+ try {
+  if ($SigningKey) {
+   if (!(Test-Path -LiteralPath $SigningKey -PathType Leaf)) { throw 'Android signing keystore was not found.' }
+   $key = (Get-Item -LiteralPath $SigningKey).FullName
+  } else {
+   $key=Join-Path $artifacts 'test-signing.p12'
+   if (!(Test-Path $key)) {
+    Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\keytool.exe') @('-genkeypair','-keystore',$key,'-storetype','PKCS12','-storepass:env','P2PSHARE_ANDROID_KEYSTORE_PASS','-alias',$ksAlias,'-keyalg','RSA','-keysize','2048','-validity','3650','-dname','CN=P2PShare Local Test')
+   }
+  }
+  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') @('-jar',(Join-Path $buildTools 'lib\apksigner.jar'),'sign','--v4-signing-enabled','false','--ks',$key,'--ks-pass','env:P2PSHARE_ANDROID_KEYSTORE_PASS','--ks-key-alias',$ksAlias,'--out',$result,$aligned)
+ } finally {
+  if ($ksPassWasSet) {
+   $env:P2PSHARE_ANDROID_KEYSTORE_PASS = $ksPassOriginal
+  } else {
+   Remove-Item Env:P2PSHARE_ANDROID_KEYSTORE_PASS -ErrorAction SilentlyContinue
   }
  }
- Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') @('-jar',(Join-Path $buildTools 'lib\apksigner.jar'),'sign','--v4-signing-enabled','false','--ks',$key,'--ks-pass','pass:p2pshare-test','--ks-key-alias','p2pshare-test','--out',$result,$aligned)
  Invoke-Checked (Join-Path $env:JAVA_HOME 'bin\java.exe') @('-jar',(Join-Path $buildTools 'lib\apksigner.jar'),'verify','--verbose',$result)
  Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-c','-P','16','4',$result)
  Write-Output "APK ready: $result"

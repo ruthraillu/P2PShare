@@ -20,12 +20,33 @@ impl VideoTexture {
         renderer: &mut egui_directx11::Renderer,
         frame: &DecodedFrame,
     ) -> Result<egui::TextureId> {
+        if frame.size.width == 0 || frame.size.height == 0 {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(0x80070057u32 as i32),
+                "Decoded video frame has zero dimensions",
+            ));
+        }
+        let Some(row_pitch) = frame.size.width.checked_mul(4) else {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(0x80070057u32 as i32),
+                "Decoded video frame row pitch overflow",
+            ));
+        };
+        if frame.gpu.is_none() {
+            let required = (row_pitch as usize).checked_mul(frame.size.height as usize);
+            if required.is_none_or(|n| frame.rgba.len() < n) {
+                return Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x80070057u32 as i32),
+                    "Decoded video frame RGBA buffer is smaller than its dimensions",
+                ));
+            }
+        }
         let format = if frame.gpu.is_some() {
             DXGI_FORMAT_B8G8R8A8_UNORM
         } else {
             DXGI_FORMAT_R8G8B8A8_UNORM
         };
-        // SAFETY: texture dimensions/pixel lengths are validated by the codec shim;
+        // SAFETY: texture dimensions and RGBA buffer bounds are validated above;
         // D3D11 owns its allocations and the immediate context is multithread protected.
         unsafe {
             if slot
@@ -80,7 +101,7 @@ impl VideoTexture {
                     0,
                     None,
                     frame.rgba.as_ptr().cast(),
-                    frame.size.width * 4,
+                    row_pitch,
                     0,
                 );
             }

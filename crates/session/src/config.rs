@@ -82,6 +82,25 @@ impl AppConfig {
                     && !self.username.chars().any(char::is_control)),
             "username must contain 1..32 printable characters"
         );
+        if let Some(avatar) = &self.avatar {
+            let path = Path::new(avatar);
+            ensure!(
+                !avatar.is_empty()
+                    && !avatar.trim().is_empty()
+                    && avatar.len() <= 256
+                    && !avatar.chars().any(char::is_control)
+                    && !avatar.contains('\\')
+                    && !avatar.contains(':')
+                    && !avatar.starts_with('/')
+                    && !avatar.ends_with('/')
+                    && !path.is_absolute()
+                    && path.components().next().is_some()
+                    && path
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "avatar must be a relative path without parent traversal or control characters"
+            );
+        }
         ensure!(
             (1..=100).contains(&self.volume_step_percent),
             "volume_step_percent must be 1..100"
@@ -170,23 +189,45 @@ impl AppConfig {
     pub fn document(&self) -> Result<String> {
         self.validate()?;
         let quote = |s: &str| toml::Value::String(s.into()).to_string();
-        let mut document = format!(
-            "# P2PShare configuration. Restart the app after editing.\n\n# Display name sent to other room members (1..32 characters).\nusername = {}\n\n# WebSocket signaling server. Both devices must use the same server for named rooms.\n# Use wss:// for public servers; ws:// is permitted only on loopback for tests.\nsignaling_url = {}\n\n# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.\n# Names are case-insensitive and repeated spaces are collapsed.\nroom_name = {}\n\n[stream]\n# Video codec: avc (default), hevc, or auto.\n# Auto prefers hardware HEVC, then hardware AVC, then software AVC.\n# Android is viewer-only and ignores the stream settings below.\ncodec = {}\n\n# Encoder backend: auto, nvenc (NVIDIA), amf (AMD), qsv (Intel), software.\nencoder = {}\n\n# Windows software encoding threads per stream: 1..8 or \"auto\" (codec chooses).\nsoftware_encode_threads = {}\n\n# Windows software decoding threads per watched stream: 1..8 or \"auto\".\n# Affects CPU decoding and hardware-decoder fallback; Android uses system codecs.\nsoftware_decode_threads = {}\n\n# Encoder bitrate in kilobits per second (100..50000).\nbitrate_kbps = {}\n\n# Target frame rate (1..120); actual throughput depends on capture and hardware.\nfps = {}\n\n# Maximum even output width (64..3840); aspect ratio is preserved.\nwidth = {}\n\n# Maximum even output height (64..3840); width * height must fit 3840 * 2160.\nheight = {}\n\n# Include the Windows mouse pointer in the shared video and previews.\n# Can also be changed live in the desktop stream settings.\nshow_cursor = {}\n\n# Include per-frame timing details in the log; increases log volume.\nlog_per_frame = {}\n\n# JPEG room preview refresh interval in seconds (10..60); maximum edge is 512 pixels.\npreview_interval_secs = {}\n\n[audio]\n# Capture selected app audio for window shares, or desktop sound for display shares.\nenabled = {}\n\n# Stereo Opus bitrate in kilobits per second (64..512), constant bitrate.\nbitrate_kbps = {}\n\n# Receive jitter buffer in milliseconds (10..100); lower values risk more underruns.\n# Used by Windows and Android playback; packets are 10 ms at 48 kHz stereo.\nplayback_buffer_ms = {}\n\n[playback]\n# Additional synchronized audio/video delay (0..1000 ms). Zero preserves immediate playback.\n# Applied by this viewer only; compressed packets are buffered with bounded memory.\nbuffer_ms = {}\n",
+        let codec = quote(
+            serde_json::to_value(self.stream.codec)?
+                .as_str()
+                .context("Invalid codec")?,
+        );
+        let encoder = quote(
+            serde_json::to_value(self.stream.encoder)?
+                .as_str()
+                .context("Invalid encoder")?,
+        );
+        let encode_threads = serde_json::to_string(&self.stream.software_encode_threads)?;
+        let decode_threads = serde_json::to_string(&self.stream.software_decode_threads)?;
+        let mut document = String::from("# P2PShare configuration. Restart the app after editing.\n\n");
+        if let Some(path) = &self.avatar {
+            document.push_str(&format!(
+                "# Processed profile image, relative to this config file.\navatar = {}\n\n",
+                quote(path)
+            ));
+        }
+        document.push_str(
+            "# UI language: en (English) or pt-BR (Português do Brasil). Restart after manual edits.\n",
+        );
+        if let Some(language) = self.language {
+            document.push_str(&format!("language = {}\n\n", quote(language.code())));
+        } else {
+            document.push('\n');
+        }
+        document.push_str(&format!(
+            "# Write diagnostics to P2PShare.log. Set false to disable logging; restart required.\nlogging_enabled = {}\n\n# Display name sent to other room members (1..32 characters).\nusername = {}\n\n# WebSocket signaling server. Both devices must use the same server for named rooms.\n# Use wss:// for public servers; ws:// is permitted only on loopback for tests.\nsignaling_url = {}\n\n# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.\n# Names are case-insensitive and repeated spaces are collapsed.\nroom_name = {}\n\n# Whether the first-start display-name prompt has been completed.\nprofile_setup_complete = {}\n\n# Playback volume change per mouse-wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n\n[stream]\n# Video codec: avc (default), hevc, or auto.\n# Auto prefers hardware HEVC, then hardware AVC, then software AVC.\n# Android is viewer-only and ignores the stream settings below.\ncodec = {}\n\n# Encoder backend: auto, nvenc (NVIDIA), amf (AMD), qsv (Intel), software.\nencoder = {}\n\n# Windows software encoding threads per stream: 1..8 or \"auto\" (codec chooses).\nsoftware_encode_threads = {}\n\n# Windows software decoding threads per watched stream: 1..8 or \"auto\".\n# Affects CPU decoding and hardware-decoder fallback; Android uses system codecs.\nsoftware_decode_threads = {}\n\n# Encoder bitrate in kilobits per second (100..50000).\nbitrate_kbps = {}\n\n# Target frame rate (1..120); actual throughput depends on capture and hardware.\nfps = {}\n\n# Maximum even output width (64..3840); aspect ratio is preserved.\nwidth = {}\n\n# Maximum even output height (64..3840); width * height must fit 3840 * 2160.\nheight = {}\n\n# Include the Windows mouse pointer in the shared video and previews.\n# Can also be changed live in the desktop stream settings.\nshow_cursor = {}\n\n# Include per-frame timing details in the log; increases log volume.\nlog_per_frame = {}\n\n# JPEG room preview refresh interval in seconds (10..60); maximum edge is 512 pixels.\npreview_interval_secs = {}\n\n[audio]\n# Capture selected app audio for window shares, or desktop sound for display shares.\nenabled = {}\n\n# Stereo Opus bitrate in kilobits per second (64..512), constant bitrate.\nbitrate_kbps = {}\n\n# Receive jitter buffer in milliseconds (10..100); lower values risk more underruns.\n# Used by Windows and Android playback; packets are 10 ms at 48 kHz stereo.\nplayback_buffer_ms = {}\n\n[playback]\n# Additional synchronized audio/video delay (0..1000 ms). Zero preserves immediate playback.\n# Applied by this viewer only; compressed packets are buffered with bounded memory.\nbuffer_ms = {}\n",
+            self.logging_enabled,
             quote(&self.username),
             quote(&self.signaling_url),
             quote(&self.room_name),
-            quote(
-                serde_json::to_value(self.stream.codec)?
-                    .as_str()
-                    .context("Invalid codec")?
-            ),
-            quote(
-                serde_json::to_value(self.stream.encoder)?
-                    .as_str()
-                    .context("Invalid encoder")?
-            ),
-            serde_json::to_string(&self.stream.software_encode_threads)?,
-            serde_json::to_string(&self.stream.software_decode_threads)?,
+            self.profile_setup_complete,
+            self.volume_step_percent,
+            codec,
+            encoder,
+            encode_threads,
+            decode_threads,
             self.stream.bitrate_kbps,
             self.stream.fps,
             self.stream.width,
@@ -197,19 +238,8 @@ impl AppConfig {
             self.audio.enabled,
             self.audio.bitrate_kbps,
             self.audio.playback_buffer_ms,
-            self.playback.buffer_ms
-        );
-        document.insert_str(document.find("# Display name").unwrap(), &format!(
-            "# Write diagnostics to P2PShare.log. Set false to disable logging; restart required.\nlogging_enabled = {}\n\n", self.logging_enabled));
-        document.insert_str(0,"# UI language: en (English) or pt-BR (Português do Brasil). Restart after manual edits.\n");
-        if let Some(language)=self.language{document.insert_str(document.find("# UI language:").unwrap()+"# UI language: en (English) or pt-BR (Português do Brasil). Restart after manual edits.\n".len(),&format!("language = {:?}\n\n",language.code()));}
-        if let Some(path)=&self.avatar {document.insert_str(0,&format!("# Processed profile image, relative to this config file.\navatar = {}\n\n",quote(path)));}
-        let profile = format!(
-            "# Whether the first-start display-name prompt has been completed.\nprofile_setup_complete = {}\n\n",
-            self.profile_setup_complete
-        );
-        document.insert_str(document.find("[stream]").unwrap(), &profile);
-        document.insert_str(document.find("[stream]").unwrap(), &format!("# Playback volume change per mouse-wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n\n",self.volume_step_percent));
+            self.playback.buffer_ms,
+        ));
         document.push_str(&format!("\n[audio_exclusions]\n# Windows whole-display shares: capture allowed apps only, excluding the names below.\n# Also controlled by Exclude app audio in the screen-sharing settings.\nenabled = {}\n\n# Executable filenames, case-insensitive; matching apps and child processes are excluded.\n# Restart after editing this list. Window-specific audio is unaffected.\nprocesses = [{}]\n",self.audio_exclusions.enabled,self.audio_exclusions.processes.iter().map(|s|quote(s)).collect::<Vec<_>>().join(", ")));
         document.push_str("\n[theme]\n");
         for (key, comment, value) in [
@@ -419,7 +449,76 @@ mod thread_tests {
     }
 }
 
-#[cfg(test)]mod avatar_config_test{#[test]fn avatar_reference_roundtrips(){let mut c=super::AppConfig::default();c.avatar=Some("profile/avatar.jpg".into());assert_eq!(super::AppConfig::parse(&c.document().unwrap()).unwrap().avatar,c.avatar);c.avatar=None;assert!(super::AppConfig::parse(&c.document().unwrap()).unwrap().avatar.is_none());}}
+#[cfg(test)]
+mod avatar_config_test {
+    #[test]
+    fn avatar_reference_roundtrips() {
+        let mut c = super::AppConfig::default();
+        c.avatar = Some("profile/avatar.jpg".into());
+        assert_eq!(
+            super::AppConfig::parse(&c.document().unwrap())
+                .unwrap()
+                .avatar,
+            c.avatar
+        );
+        c.avatar = Some("data/profile/avatar.jpg".into());
+        assert_eq!(
+            super::AppConfig::parse(&c.document().unwrap())
+                .unwrap()
+                .avatar,
+            c.avatar
+        );
+        c.avatar = None;
+        assert!(
+            super::AppConfig::parse(&c.document().unwrap())
+                .unwrap()
+                .avatar
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn username_with_toml_markers_and_invalid_avatar_paths_are_handled_safely() {
+        let mut c = super::AppConfig::default();
+        c.username = "[stream] # Display name".into();
+        c.avatar = Some("data/profile/avatar.jpg".into());
+        let doc = c.document().unwrap();
+        let parsed = super::AppConfig::parse(&doc).unwrap();
+        assert_eq!(parsed.username, "[stream] # Display name");
+        assert_eq!(parsed.avatar.as_deref(), Some("data/profile/avatar.jpg"));
+
+        for bad in [
+            "",
+            "   ",
+            "../secret.jpg",
+            "profile/../secret.jpg",
+            "/etc/passwd",
+            "C:/Windows/win.ini",
+            "profile\\avatar.jpg",
+            "avatar\0.jpg",
+            "avatar\n.jpg",
+            "./profile/avatar.jpg",
+            "profile/avatar.jpg/",
+        ] {
+            assert!(
+                super::AppConfig::parse(&format!(
+                    "avatar = {}",
+                    toml::Value::String(bad.into())
+                ))
+                .is_err(),
+                "expected invalid avatar to fail: {bad:?}"
+            );
+        }
+        let too_long = "a".repeat(257);
+        assert!(
+            super::AppConfig::parse(&format!(
+                "avatar = {}",
+                toml::Value::String(too_long)
+            ))
+            .is_err()
+        );
+    }
+}
 
 #[cfg(test)]mod language_config_tests {
  #[test]fn language_is_optional_and_preserves_first_name_prompt(){

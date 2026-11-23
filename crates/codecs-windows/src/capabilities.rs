@@ -539,19 +539,33 @@ pub(crate) fn decoder(
     display: Option<&ID3D11Device>,
 ) -> Result<ffmpeg::Decoder> {
     if let Ok(cache) = get() {
-        for p in cache.decoders.iter().filter(|p| {
-            p.codec == format
-                && p.supported
-                && p.name == "d3d11va"
-                && cache.adapters.iter().any(|a| a.index == p.adapter)
-        }) {
-            let display = display.filter(|d| {
-                cache
-                    .adapters
-                    .iter()
-                    .any(|a| a.index == p.adapter && a.luid == ffmpeg::luid(d))
-            });
-            match ffmpeg::Decoder::with_device(format, size, threads, true, p.adapter, display) {
+        let display_luid = display.map(ffmpeg::luid);
+        let preferred = cache
+            .adapters
+            .iter()
+            .find(|a| Some(a.luid) == display_luid)
+            .map(|a| a.index);
+        let mut probes: Vec<_> = cache
+            .decoders
+            .iter()
+            .filter(|p| {
+                p.codec == format
+                    && p.supported
+                    && p.name == "d3d11va"
+                    && cache.adapters.iter().any(|a| a.index == p.adapter)
+            })
+            .collect();
+        probes.sort_by_key(|p| Some(p.adapter) != preferred);
+        for p in probes {
+            let bound_display = display.filter(|_| Some(p.adapter) == preferred);
+            match ffmpeg::Decoder::with_device(
+                format,
+                size,
+                threads,
+                true,
+                p.adapter,
+                bound_display,
+            ) {
                 Ok(decoder) => {
                     tracing::info!(
                         codec = format.label(),
@@ -562,7 +576,7 @@ pub(crate) fn decoder(
                 }
                 Err(error) => {
                     tracing::warn!(%error,"hardware_decoder_initialization_failed");
-                    if display.is_some()
+                    if bound_display.is_some()
                         && let Ok(decoder) =
                             ffmpeg::Decoder::new(format, size, threads, true, p.adapter)
                     {

@@ -146,6 +146,8 @@ impl Preview {
         unsafe {
             self.graphics.context.OMSetRenderTargets(None, None);
             self.target = None;
+            self.size = Dimensions::default();
+            self.graphics.context.Flush();
             self.swap.ResizeBuffers(
                 0,
                 size.width,
@@ -154,8 +156,8 @@ impl Preview {
                 DXGI_SWAP_CHAIN_FLAG(0),
             )?;
         }
-        self.size = size;
         self.create_target()?;
+        self.size = size;
         self.draw()
     }
     pub fn present(&mut self, frame: &GpuFrame) -> Result<()> {
@@ -191,6 +193,9 @@ impl Preview {
             context.ClearRenderTargetView(target, &[0.035, 0.045, 0.065, 1.0]);
             if self.view.is_some() && !self.frame_size.is_empty() {
                 let v = letterbox(self.frame_size, self.size);
+                context.OMSetBlendState(None, Some(&[0.0; 4]), u32::MAX);
+                context.OMSetDepthStencilState(None, 0);
+                context.RSSetState(None);
                 context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                     TopLeftX: v.x as f32,
                     TopLeftY: v.y as f32,
@@ -199,6 +204,7 @@ impl Preview {
                     MinDepth: 0.0,
                     MaxDepth: 1.0,
                 }]));
+                context.IASetInputLayout(None);
                 context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 context.VSSetShader(&self.vertex, None);
                 context.PSSetShader(&self.pixel, None);

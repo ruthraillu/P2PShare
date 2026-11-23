@@ -6,14 +6,14 @@ use winit::window::{Fullscreen, WindowLevel};
 
 pub(super) struct Detached {
     avatar_textures:HashMap<u64,(std::sync::Arc<[u8]>,egui::TextureHandle)>,
-
-    pub window: Window,
-    fit: super::detached_fit::Guard,
     pub target: Option<ID3D11RenderTargetView>,
-    pub app: App,
-    pub occluded: bool,
     swap: IDXGISwapChain1,
     renderer: egui_directx11::Renderer,
+    fit: super::detached_fit::Guard,
+    pub window: Window,
+    pub app: App,
+    pub occluded: bool,
+    target_retry: Option<Instant>,
     ctx: egui::Context,
     source_texture: Option<egui::TextureId>,
     texture_alias: Option<egui::TextureId>,
@@ -39,7 +39,7 @@ impl Detached {
         app.members = parent.members.clone();
         app.joined = parent.joined;
         app.watching = parent.watching.clone();
-        app.stream_viewers=parent.stream_viewers.clone();app.profile_names=parent.profile_names.clone();app.profile_images=parent.profile_images.clone();app.avatars.clear();
+        app.stream_viewers=parent.stream_viewers.clone();app.profile_names=parent.profile_names.clone();app.profile_images=parent.profile_images.clone();app.profile_nicknames=parent.profile_nicknames.clone();app.nickname_save_failed=parent.nickname_save_failed;app.avatars.clear();
         app.local_preview_hidden = parent.local_preview_hidden;
         app.popped_out = Some(index);
         app.focus = Some(index);
@@ -98,14 +98,15 @@ impl Detached {
             Some(16384),
         );
         let mut view = Self {
-            window,
-            fit,
-            target: None,
-            app,
             avatar_textures:Default::default(),
-            occluded: false,
+            target: None,
             swap,
             renderer,
+            fit,
+            window,
+            app,
+            occluded: false,
+            target_retry: None,
             ctx,
             source_texture,
             texture_alias: None,
@@ -150,7 +151,9 @@ impl Detached {
                 DXGI_SWAP_CHAIN_FLAG(0),
             )?;
         }
-        self.make_target(graphics)
+        self.make_target(graphics)?;
+        self.target_retry = None;
+        Ok(())
     }
     // Input never presents a frame. Queue it for the shared playback loop,
     // which polls/decode-updates once and supplies exactly one vsync wait.
@@ -194,7 +197,7 @@ impl Detached {
             }
         }
 
-        self.app.stream_viewers=parent.stream_viewers.clone();self.app.profile_names=parent.profile_names.clone();self.app.profile_images=parent.profile_images.clone();self.app.avatars.clear();for (id,(_,texture)) in &self.avatar_textures{self.app.avatars.insert(*id,texture.id());}
+        self.app.stream_viewers=parent.stream_viewers.clone();self.app.profile_names=parent.profile_names.clone();self.app.profile_images=parent.profile_images.clone();self.app.profile_nicknames=parent.profile_nicknames.clone();self.app.nickname_save_failed=parent.nickname_save_failed;self.app.avatars.clear();for (id,(_,texture)) in &self.avatar_textures{self.app.avatars.insert(*id,texture.id());}
         self.app.local_preview_hidden = parent.local_preview_hidden;
         let index = self.app.members.iter().position(|m| m.id == self.peer);
         // An absent peer must never cause this window to switch to someone else's screen.
@@ -290,6 +293,13 @@ impl Detached {
         result
     }
     fn draw(&mut self, parent: &mut View, wait_vsync: bool) -> anyhow::Result<bool> {
+        if let Some(retry) = self.target_retry {
+            if Instant::now() < retry {
+                return Ok(false);
+            }
+            self.resize(&parent.graphics, self.window.inner_size())?;
+            tracing::info!(peer = self.peer, "popout_display_transition_recovered");
+        }
         self.sync(&parent.design);
         // The parent consumes shared texture deltas. A paused/JPEG-only child
         // still needs to present when the same texture receives a new image.
@@ -429,8 +439,17 @@ impl Runner {
                 Ok(true) => closed.push(*peer),
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(%error, peer, "popout_draw_failed");
-                    closed.push(*peer);
+                    if error
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|e| transient_display_error(e.code().0))
+                    {
+                        tracing::warn!(%error, peer, "popout_display_transition_retry");
+                        child.target = None;
+                        child.target_retry = Some(Instant::now() + Duration::from_millis(250));
+                    } else {
+                        tracing::warn!(%error, peer, "popout_draw_failed");
+                        closed.push(*peer);
+                    }
                 }
             }
         }
@@ -444,7 +463,7 @@ impl Runner {
     }
     pub(super) fn child_event(
         &mut self,
-        _ev: &ActiveEventLoop,
+        ev: &ActiveEventLoop,
         peer: u64,
         event: WindowEvent,
     ) -> anyhow::Result<()> {
@@ -457,14 +476,41 @@ impl Runner {
             }
             return Ok(());
         }
-        let Some(parent) = &mut self.view else {
-            return Ok(());
+        let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+        let (needs_redraw, main_visible) = {
+            let Some(parent) = &mut self.view else {
+                return Ok(());
+            };
+            let Some(child) = self.popouts.get_mut(&peer) else {
+                return Ok(());
+            };
+            let needs_redraw = match child.on_event(&parent.graphics, &event) {
+                Ok(needs) => needs,
+                Err(error)
+                    if error
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|e| transient_display_error(e.code().0)) =>
+                {
+                    tracing::warn!(%error, peer, "popout_event_display_transition_retry");
+                    child.target = None;
+                    child.target_retry = Some(Instant::now() + Duration::from_millis(250));
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let main_visible = !parent.occluded && parent.target.is_some();
+            if main_visible {
+                if needs_redraw {
+                    parent.request_redraw();
+                }
+            } else if needs_redraw && !is_redraw {
+                child.window.request_redraw();
+                parent.next_redraw = Instant::now();
+            }
+            (needs_redraw, main_visible)
         };
-        let Some(child) = self.popouts.get_mut(&peer) else {
-            return Ok(());
-        };
-        if child.on_event(&parent.graphics, &event)? {
-            parent.request_redraw();
+        if !main_visible && is_redraw && needs_redraw {
+            self.tick_detached_only(ev);
         }
         Ok(())
     }

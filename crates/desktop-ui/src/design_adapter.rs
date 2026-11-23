@@ -124,8 +124,8 @@ impl View {
         let roster=self.session.snapshot();
         for source in &roster.members {
             if let Some(viewers)=self.session.stream_viewers(&source.id){
-                let names=viewers.iter().filter_map(|id|roster.members.iter().find(|m|&m.id==id).map(|m|m.name.clone())).collect();
-                self.design.stream_viewers.insert(if source.id==roster.local_id{0}else{p2pshare_room_ui::peer_ui_id(&source.id)},names);
+                let entries=viewers.iter().filter_map(|id|roster.members.iter().find(|m|&m.id==id).map(|m|(if m.id==roster.local_id{0}else{p2pshare_room_ui::peer_ui_id(&m.id)},m.name.clone()))).collect();
+                self.design.stream_viewers.insert(if source.id==roster.local_id{0}else{p2pshare_room_ui::peer_ui_id(&source.id)},entries);
             }
         }
         self.design.maximized = self.window.is_maximized();
@@ -244,10 +244,7 @@ impl View {
             && self.ui.capture_running
             && let Some(audio) = &self.audio
         {
-            let source = self
-                .active_source
-                .and_then(|id| self.ui.sources.iter().find(|s| s.id == id));
-            audio.set_source(source);
+            audio.set_source(self.active_source.as_ref());
         }
         tracing::info!("desktop_settings_saved");
         Ok(())
@@ -385,7 +382,9 @@ impl View {
                     Intent::SetNickname { peer, nickname } => self.save_nickname(peer, nickname),
                     Intent::Join(room) => {
                         self.app_config.room_name = room.clone();
-                        std::fs::write(&self.config_path, self.app_config.document()?)?;
+                        let pending = p2pshare_media::portable::config_pending_path()?;
+                        std::fs::write(&pending, self.app_config.document()?)?;
+                        std::fs::rename(pending, &self.config_path)?;
                         self.ui.room_name = room.clone();
                         self.action(Action::NamedRoom {
                             room,

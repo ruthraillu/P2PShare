@@ -21,7 +21,7 @@ use windows::{
         Direct3D11::*,
         Dxgi::{Common::*, DXGI_ERROR_WAS_STILL_DRAWING},
     },
-    core::s,
+    core::{Interface, s},
 };
 #[derive(Clone)]
 pub struct RawFrame {
@@ -29,6 +29,19 @@ pub struct RawFrame {
     pub bytes: Vec<u8>,
     pub queued_at: Instant,
     pub micros: u64,
+    pool: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+}
+impl Drop for RawFrame {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool
+            && let Ok(mut pool) = pool.lock()
+            && pool.len() < 4
+        {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            bytes.clear();
+            pool.push(bytes);
+        }
+    }
 }
 pub struct DecodedFrame {
     pub size: Dimensions,
@@ -43,10 +56,7 @@ pub struct Encoded {
 }
 enum Work {
     Decode(String, Arc<[u8]>, VideoFormat, Dimensions),
-    Retain(Vec<String>),
-    CpuOutput(String),
     Wake,
-    Reset,
 }
 #[derive(Default)]
 struct Shared {
@@ -60,6 +70,9 @@ struct Shared {
     encoded_drops: u64,
     encoder_skips: u64,
     keyframe_requests: HashSet<String>,
+    pending_retain: Option<HashSet<String>>,
+    pending_cpu_output: HashSet<String>,
+    reset_pending: bool,
 }
 pub struct CodecWorker {
     work: mpsc::SyncSender<Work>,
@@ -78,86 +91,319 @@ impl CodecWorker {
         let force = Arc::new(AtomicBool::new(true));
         let s = shared.clone();
         let f = force.clone();
-        std::thread::Builder::new().name("p2pshare-video-codecs".into()).spawn(move|| {
-            let _apartment=CodecApartment::new();
-            let mut decoders:HashMap<String,crate::ffmpeg::Decoder>=HashMap::new();
-            let mut cpu_output=HashSet::new();
-            let mut encoder:Option<crate::ffmpeg::Encoder>=None;
-            let mut last_raw:Option<RawFrame>=None;let mut dimensions=Dimensions::default();
-            let mut settings=StreamConfig::default();let mut failed_encoders=HashSet::new();
-            let mut last_time=0;
-            let mut meter=FrameMeter::new("encoded");let mut latency=LatencyMeter::new("encode");
-            let mut queue_latency=LatencyMeter::new("capture_to_encoder_queue");
-            let mut batch=VecDeque::with_capacity(32);
-            while let Ok(first)=rx.recv() {
-                batch.push_back(first);
-                batch.extend(rx.try_iter().take(31));
-                while let Some(work)=batch.pop_front() {
-                let display=match &work {Work::Decode(peer,..)=>!batch.iter().any(|w|matches!(w,Work::Decode(p,..) if p==peer)),_=>true};
-                let result=(||->Result<()> {
-                    match work {
-                        Work::Decode(peer,data,format,size)=> {
-                            let threads=s.lock().unwrap().settings.software_decode_threads.ffmpeg_threads();
-                            if decoders.get(&peer).is_none_or(|d|d.format!=format || d.size!=size) {
-                                let mut decoder=crate::capabilities::decoder(format,size,threads,device.as_ref())?;
-                                if cpu_output.contains(&peer) {decoder.disable_gpu_output();}
-                                decoders.insert(peer.clone(),decoder);
+        std::thread::Builder::new()
+            .name("p2pshare-video-codecs".into())
+            .spawn(move || {
+                let _apartment = CodecApartment::new();
+                let mut decoders: HashMap<String, crate::ffmpeg::Decoder> = HashMap::new();
+                let mut consecutive_decode_errors: HashMap<String, u32> = HashMap::new();
+                let mut cpu_output = HashSet::new();
+                let mut encoder: Option<crate::ffmpeg::Encoder> = None;
+                let mut last_raw: Option<RawFrame> = None;
+                let mut dimensions = Dimensions::default();
+                let mut settings = StreamConfig::default();
+                let mut failed_encoders = HashSet::new();
+                let mut last_time: u64 = 0;
+                let mut meter = FrameMeter::new("encoded");
+                let mut latency = LatencyMeter::new("encode");
+                let mut queue_latency = LatencyMeter::new("capture_to_encoder_queue");
+                let mut batch = VecDeque::with_capacity(32);
+
+                while let Ok(first) = rx.recv() {
+                    batch.push_back(first);
+                    batch.extend(rx.try_iter().take(31));
+                    while let Some(work) = batch.pop_front() {
+                        {
+                            let mut shared = s.lock().unwrap();
+                            if let Some(peers) = shared.pending_retain.take() {
+                                cpu_output.retain(|p| peers.contains(p));
+                                decoders.retain(|p, _| peers.contains(p));
+                                consecutive_decode_errors.retain(|p, _| peers.contains(p));
+                                shared.decoded.retain(|p, _| peers.contains(p));
                             }
-                            match decoders.get_mut(&peer).unwrap().decode_for_display(&data,display) {
-                                Ok(Some(frame))=>{s.lock().unwrap().decoded.insert(peer,frame);},
-                                Ok(None)=>{},
-                                Err(error)=>{
-                                    tracing::warn!(%error,peer,codec=format.label(),"decoder_failed_using_software");
-                                    decoders.insert(peer.clone(),crate::ffmpeg::Decoder::new(format,size,threads,false,0)?);
-                                    if let Ok(Some(frame))=decoders.get_mut(&peer).unwrap().decode_for_display(&data,display) {s.lock().unwrap().decoded.insert(peer.clone(),frame);}
+                            if !shared.pending_cpu_output.is_empty() {
+                                for peer in shared.pending_cpu_output.drain() {
+                                    if let Some(d) = decoders.get_mut(&peer) {
+                                        d.disable_gpu_output();
+                                    }
+                                    cpu_output.insert(peer);
+                                }
+                            }
+                            if shared.reset_pending {
+                                shared.reset_pending = false;
+                                encoder = None;
+                                last_raw = None;
+                                dimensions = Dimensions::default();
+                                failed_encoders.clear();
+                                last_time = 0;
+                                f.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        let Work::Decode(peer, data, format, size) = work else {
+                            continue;
+                        };
+                        let display = !batch
+                            .iter()
+                            .any(|w| matches!(w, Work::Decode(p, ..) if p == &peer));
+                        let result = (|| -> Result<()> {
+                            let threads = s
+                                .lock()
+                                .unwrap()
+                                .settings
+                                .software_decode_threads
+                                .ffmpeg_threads();
+                            if decoders
+                                .get(&peer)
+                                .is_none_or(|d| d.format != format || d.size != size)
+                            {
+                                let mut decoder = crate::capabilities::decoder(
+                                    format,
+                                    size,
+                                    threads,
+                                    device.as_ref(),
+                                )?;
+                                if cpu_output.contains(&peer) {
+                                    decoder.disable_gpu_output();
+                                }
+                                decoders.insert(peer.clone(), decoder);
+                                consecutive_decode_errors.remove(&peer);
+                            }
+                            match decoders
+                                .get_mut(&peer)
+                                .unwrap()
+                                .decode_for_display(&data, display)
+                            {
+                                Ok(Some(frame)) => {
+                                    consecutive_decode_errors.remove(&peer);
+                                    s.lock().unwrap().decoded.insert(peer, frame);
+                                }
+                                Ok(None) => {
+                                    consecutive_decode_errors.remove(&peer);
+                                }
+                                Err(crate::ffmpeg::DecodeError::Bitstream(error)) => {
+                                    tracing::debug!(
+                                        %error,
+                                        peer,
+                                        codec = format.label(),
+                                        "decoder_bitstream_error_requesting_keyframe"
+                                    );
+                                    s.lock().unwrap().keyframe_requests.insert(peer);
+                                }
+                                Err(crate::ffmpeg::DecodeError::HardwareFallback(error)) => {
+                                    tracing::warn!(
+                                        %error,
+                                        peer,
+                                        codec = format.label(),
+                                        "decoder_failed_using_software"
+                                    );
+                                    consecutive_decode_errors.remove(&peer);
+                                    decoders.insert(
+                                        peer.clone(),
+                                        crate::ffmpeg::Decoder::new(
+                                            format, size, threads, false, 0,
+                                        )?,
+                                    );
+                                    if let Ok(Some(frame)) = decoders
+                                        .get_mut(&peer)
+                                        .unwrap()
+                                        .decode_for_display(&data, display)
+                                    {
+                                        s.lock().unwrap().decoded.insert(peer.clone(), frame);
+                                    }
+                                    s.lock().unwrap().keyframe_requests.insert(peer);
+                                }
+                                Err(crate::ffmpeg::DecodeError::Other(error)) => {
+                                    let count = consecutive_decode_errors
+                                        .entry(peer.clone())
+                                        .or_insert(0);
+                                    *count = count.saturating_add(1);
+                                    let is_hardware =
+                                        decoders.get(&peer).is_some_and(|d| d.hardware);
+                                    if is_hardware && *count >= 3 {
+                                        tracing::warn!(
+                                            %error,
+                                            peer,
+                                            codec = format.label(),
+                                            consecutive_errors = *count,
+                                            "decoder_failed_using_software"
+                                        );
+                                        consecutive_decode_errors.remove(&peer);
+                                        decoders.insert(
+                                            peer.clone(),
+                                            crate::ffmpeg::Decoder::new(
+                                                format, size, threads, false, 0,
+                                            )?,
+                                        );
+                                        if let Ok(Some(frame)) = decoders
+                                            .get_mut(&peer)
+                                            .unwrap()
+                                            .decode_for_display(&data, display)
+                                        {
+                                            s.lock().unwrap().decoded.insert(peer.clone(), frame);
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            %error,
+                                            peer,
+                                            codec = format.label(),
+                                            hardware = is_hardware,
+                                            consecutive_errors = *count,
+                                            "decoder_error_requesting_keyframe"
+                                        );
+                                    }
                                     s.lock().unwrap().keyframe_requests.insert(peer);
                                 }
                             }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            tracing::error!(%error, "codec_worker_error");
+                            s.lock().unwrap().error = Some(format!("Video codec: {error:#}"));
+                        }
+                    }
+
+                    // Always service pending control signals and encode after draining a batch
+                    // so heavy decode traffic can never starve local encoding.
+                    let encode_result = (|| -> Result<()> {
+                        {
+                            let mut shared = s.lock().unwrap();
+                            if let Some(peers) = shared.pending_retain.take() {
+                                cpu_output.retain(|p| peers.contains(p));
+                                decoders.retain(|p, _| peers.contains(p));
+                                consecutive_decode_errors.retain(|p, _| peers.contains(p));
+                                shared.decoded.retain(|p, _| peers.contains(p));
+                            }
+                            if !shared.pending_cpu_output.is_empty() {
+                                for peer in shared.pending_cpu_output.drain() {
+                                    if let Some(d) = decoders.get_mut(&peer) {
+                                        d.disable_gpu_output();
+                                    }
+                                    cpu_output.insert(peer);
+                                }
+                            }
+                            if shared.reset_pending {
+                                shared.reset_pending = false;
+                                encoder = None;
+                                last_raw = None;
+                                dimensions = Dimensions::default();
+                                failed_encoders.clear();
+                                last_time = 0;
+                                f.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        let requested = s.lock().unwrap().settings;
+                        if requested != settings {
+                            settings = requested;
+                            meter.set_fps(settings.fps);
+                            encoder = None;
+                            dimensions = Dimensions::default();
+                            last_raw = None;
+                            failed_encoders.clear();
+                            s.lock().unwrap().encoded.clear();
+                            f.store(true, Ordering::Relaxed);
+                        }
+                        let raw = s.lock().unwrap().raw.take().or_else(|| {
+                            if f.load(Ordering::Relaxed) {
+                                last_raw.clone()
+                            } else {
+                                None
+                            }
+                        });
+                        let Some(raw) = raw else {
                             return Ok(());
+                        };
+                        let started = Instant::now();
+                        queue_latency.record(raw.queued_at.elapsed().as_secs_f64() * 1000.);
+                        let mut attempts = 0usize;
+                        let frames = loop {
+                            if raw.size != dimensions || encoder.is_none() {
+                                if raw.size != dimensions {
+                                    failed_encoders.clear();
+                                }
+                                dimensions = raw.size;
+                                s.lock().unwrap().encoded.clear();
+                                let enc = crate::capabilities::open_cpu_encoder(
+                                    settings,
+                                    dimensions,
+                                    &mut failed_encoders,
+                                )?;
+                                s.lock().unwrap().backend = format!("FFmpeg {}", enc.name);
+                                encoder = Some(enc);
+                                f.store(true, Ordering::Relaxed);
+                            }
+                            // Requests are set for encoder creation/reset, join and recovery.
+                            // Do not periodically reset the reference picture while it is healthy.
+                            let keyframe = f.swap(false, Ordering::Relaxed);
+                            let micros = raw.micros.max(last_time.saturating_add(100));
+                            last_time = micros;
+                            match encoder.as_mut().unwrap().submit(
+                                Some(&raw.bytes),
+                                None,
+                                micros,
+                                keyframe,
+                            ) {
+                                Ok(frames) => break frames,
+                                Err(error) => {
+                                    let failed = encoder.take().unwrap();
+                                    failed.runtime_failure(&error);
+                                    failed_encoders.insert((failed.name, failed.adapter));
+                                    f.store(true, Ordering::Relaxed);
+                                    if settings.encoder
+                                        == p2pshare_media::config::EncoderBackend::Auto
+                                        && attempts < 8
+                                    {
+                                        attempts += 1;
+                                        tracing::warn!(
+                                            %error,
+                                            attempt = attempts,
+                                            "encoder_runtime_failure_trying_next_backend"
+                                        );
+                                        continue;
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                        };
+                        latency.record(started.elapsed().as_secs_f64() * 1000.);
+                        if frames.is_empty() {
+                            s.lock().unwrap().encoder_skips += 1;
                         }
-                        Work::CpuOutput(peer)=>{cpu_output.insert(peer.clone()); if let Some(d)=decoders.get_mut(&peer) {d.disable_gpu_output();} return Ok(());},
-                        Work::Retain(peers)=>{cpu_output.retain(|p|peers.contains(p));decoders.retain(|p,_|peers.contains(p));s.lock().unwrap().decoded.retain(|p,_|peers.contains(p));return Ok(());},
-                        Work::Reset=>{encoder=None;last_raw=None;dimensions=Dimensions::default();failed_encoders.clear();f.store(true,Ordering::Relaxed);},
-                        Work::Wake=>{},
-                    }
-                    let requested=s.lock().unwrap().settings;
-                    if requested!=settings {settings=requested;meter.set_fps(settings.fps);encoder=None;dimensions=Dimensions::default();last_raw=None;failed_encoders.clear();s.lock().unwrap().encoded.clear();f.store(true,Ordering::Relaxed);}
-                    let raw=s.lock().unwrap().raw.take().or_else(||if f.load(Ordering::Relaxed){last_raw.clone()}else{None});
-                    let Some(raw)=raw else {return Ok(());};
-                    if raw.size!=dimensions || encoder.is_none() {
-                        if raw.size!=dimensions {failed_encoders.clear();}
-                        dimensions=raw.size;s.lock().unwrap().encoded.clear();
-                        let enc=crate::capabilities::open_cpu_encoder(settings,dimensions,&mut failed_encoders)?;
-                        s.lock().unwrap().backend=format!("FFmpeg {}",enc.name);encoder=Some(enc);
-                        f.store(true,Ordering::Relaxed);
-                    }
-                    let started=Instant::now();queue_latency.record(raw.queued_at.elapsed().as_secs_f64()*1000.);
-                    // Requests are set for encoder creation/reset, join and recovery.
-                    // Do not periodically reset the reference picture while it is healthy.
-                    let keyframe=f.swap(false,Ordering::Relaxed);
-                    let micros=raw.micros.max(last_time+100);last_time=micros;
-                    let frames=match encoder.as_mut().unwrap().submit(Some(&raw.bytes),None,micros,keyframe) {
-                        Ok(frames)=>frames,
-                        Err(error)=>{encoder.as_ref().unwrap().runtime_failure(&error);failed_encoders.insert((encoder.as_ref().unwrap().name.clone(),encoder.as_ref().unwrap().adapter));encoder=None;f.store(true,Ordering::Relaxed);if settings.encoder==p2pshare_media::config::EncoderBackend::Auto {tracing::warn!(%error,"encoder_runtime_failure_trying_next_backend");last_raw=Some(raw);return Ok(());}return Err(error);}
-                    };
-                    latency.record(started.elapsed().as_secs_f64()*1000.);
-                    if frames.is_empty(){s.lock().unwrap().encoder_skips+=1;}
-                    for frame in frames {
-                        meter.frame(frame.bytes.len());
-                        if diagnostics::enabled()&&settings.log_per_frame {tracing::info!(pts_us=frame.micros,bytes=frame.bytes.len(),encode_ms=started.elapsed().as_secs_f64()*1000.,"encoder_frame");}
-                        let mut shared=s.lock().unwrap();
-                        if shared.encoded.len()>=8 || shared.encoded.iter().map(|e|e.bytes.len()).sum::<usize>()+frame.bytes.len()>8*1024*1024 {
-                            shared.encoded_drops+=shared.encoded.len() as u64;shared.encoded.clear();f.store(true,Ordering::Relaxed);
-                            if !frame.keyframe {shared.encoded_drops+=1;continue;}
+                        for frame in frames {
+                            meter.frame(frame.bytes.len());
+                            if diagnostics::enabled() && settings.log_per_frame {
+                                tracing::info!(
+                                    pts_us = frame.micros,
+                                    bytes = frame.bytes.len(),
+                                    encode_ms = started.elapsed().as_secs_f64() * 1000.,
+                                    "encoder_frame"
+                                );
+                            }
+                            let mut shared = s.lock().unwrap();
+                            if shared.encoded.len() >= 8
+                                || shared.encoded.iter().map(|e| e.bytes.len()).sum::<usize>()
+                                    + frame.bytes.len()
+                                    > 8 * 1024 * 1024
+                            {
+                                shared.encoded_drops += shared.encoded.len() as u64;
+                                shared.encoded.clear();
+                                f.store(true, Ordering::Relaxed);
+                                if !frame.keyframe {
+                                    shared.encoded_drops += 1;
+                                    continue;
+                                }
+                            }
+                            shared.encoded.push_back(frame);
                         }
-                        shared.encoded.push_back(frame);
+                        meter.report();
+                        last_raw = Some(raw);
+                        Ok(())
+                    })();
+                    if let Err(error) = encode_result {
+                        tracing::error!(%error, "codec_worker_error");
+                        s.lock().unwrap().error = Some(format!("Video codec: {error:#}"));
                     }
-                    meter.report();last_raw=Some(raw);Ok(())
-                })();
-                if let Err(error)=result {tracing::error!(%error,"codec_worker_error");s.lock().unwrap().error=Some(format!("Video codec: {error:#}"));}
                 }
-            }
-        })?;
+            })?;
         Ok(Self {
             work,
             shared,
@@ -195,12 +441,17 @@ impl CodecWorker {
             .is_ok()
     }
     pub fn use_cpu_output(&self, peer: String) {
-        // A bounded blocking send here would stall rendering. Retry via the caller
-        // if the queue is full instead.
-        let _ = self.work.try_send(Work::CpuOutput(peer));
+        self.shared.lock().unwrap().pending_cpu_output.insert(peer);
+        let _ = self.work.try_send(Work::Wake);
     }
     pub fn retain(&self, peers: Vec<String>) {
-        let _ = self.work.try_send(Work::Retain(peers));
+        let set: HashSet<String> = peers.into_iter().collect();
+        let mut s = self.shared.lock().unwrap();
+        s.decoded.retain(|p, _| set.contains(p));
+        s.pending_cpu_output.retain(|p| set.contains(p));
+        s.pending_retain = Some(set);
+        drop(s);
+        let _ = self.work.try_send(Work::Wake);
     }
     pub fn request_keyframe(&self) {
         self.force.store(true, Ordering::Relaxed);
@@ -236,7 +487,9 @@ impl CodecWorker {
         let mut s = self.shared.lock().unwrap();
         s.raw = None;
         s.encoded.clear();
-        let _ = self.work.try_send(Work::Reset);
+        s.reset_pending = true;
+        drop(s);
+        let _ = self.work.try_send(Work::Wake);
     }
 }
 const SHADER: &[u8] = br#"
@@ -261,6 +514,9 @@ pub struct Readback {
     busy_polls: u64,
     submission_drops: u64,
     rtv: Option<ID3D11RenderTargetView>,
+    input_texture: Option<ID3D11Texture2D>,
+    input_srv: Option<ID3D11ShaderResourceView>,
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     size: Dimensions,
     started: Instant,
     settings: StreamConfig,
@@ -337,6 +593,9 @@ impl Readback {
                 busy_polls: 0,
                 submission_drops: 0,
                 rtv: None,
+                input_texture: None,
+                input_srv: None,
+                buffers: Arc::new(Mutex::new(Vec::new())),
                 size: Dimensions::default(),
                 started: Instant::now(),
                 settings: StreamConfig::default(),
@@ -357,6 +616,11 @@ impl Readback {
         self.staging.clear();
         self.target = None;
         self.rtv = None;
+        self.input_texture = None;
+        self.input_srv = None;
+        if let Ok(mut pool) = self.buffers.lock() {
+            pool.clear();
+        }
         self.size = Dimensions::default();
     }
     pub fn diagnostics(&self) -> String {
@@ -392,7 +656,17 @@ impl Readback {
                 result => result?,
             }
             let stride = self.size.width as usize * 4;
-            let mut bytes = vec![0; stride * self.size.height as usize];
+            let len = stride * self.size.height as usize;
+            let mut bytes = self
+                .buffers
+                .lock()
+                .ok()
+                .and_then(|mut pool| pool.pop())
+                .unwrap_or_default();
+            bytes.clear();
+            if bytes.capacity() < len {
+                bytes.reserve_exact(len);
+            }
             for row in 0..self.size.height as usize {
                 std::ptr::copy_nonoverlapping(
                     (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
@@ -400,6 +674,7 @@ impl Readback {
                     stride,
                 );
             }
+            bytes.set_len(len);
             c.Unmap(&slot.texture, 0);
             self.staging[index].submitted = None;
             self.pending.pop_front();
@@ -415,6 +690,7 @@ impl Readback {
                 size: self.size,
                 bytes,
                 micros,
+                pool: Some(self.buffers.clone()),
             }))
         }
     }
@@ -440,7 +716,10 @@ impl Readback {
                 self.staging.clear();
                 self.pending.clear();
                 self.rtv = None;
-                self.size = size;
+                self.size = Dimensions::default();
+                if let Ok(mut pool) = self.buffers.lock() {
+                    pool.clear();
+                }
                 let mut desc = D3D11_TEXTURE2D_DESC {
                     Width: size.width,
                     Height: size.height,
@@ -455,27 +734,33 @@ impl Readback {
                     BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
                     ..Default::default()
                 };
+                let mut target = None;
                 self.graphics
                     .device
-                    .CreateTexture2D(&desc, None, Some(&mut self.target))?;
-                self.graphics.device.CreateRenderTargetView(
-                    self.target.as_ref().unwrap(),
-                    None,
-                    Some(&mut self.rtv),
-                )?;
+                    .CreateTexture2D(&desc, None, Some(&mut target))?;
+                let target = target.unwrap();
+                let mut rtv = None;
+                self.graphics
+                    .device
+                    .CreateRenderTargetView(&target, None, Some(&mut rtv))?;
                 desc.Usage = D3D11_USAGE_STAGING;
                 desc.BindFlags = 0;
                 desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                let mut staging = Vec::with_capacity(3);
                 for _ in 0..3 {
                     let mut texture = None;
                     self.graphics
                         .device
                         .CreateTexture2D(&desc, None, Some(&mut texture))?;
-                    self.staging.push(StagingSlot {
+                    staging.push(StagingSlot {
                         texture: texture.unwrap(),
                         submitted: None,
                     });
                 }
+                self.target = Some(target);
+                self.rtv = rtv;
+                self.staging = staging;
+                self.size = size;
             }
             let Some(index) = self
                 .staging
@@ -485,10 +770,16 @@ impl Readback {
                 self.submission_drops += 1;
                 return Ok(false);
             };
-            let mut srv = None;
-            self.graphics
-                .device
-                .CreateShaderResourceView(input, None, Some(&mut srv))?;
+            if self.input_texture.as_ref().map(Interface::as_raw) != Some(input.as_raw()) {
+                self.input_srv = None;
+                self.input_texture = None;
+                let mut srv = None;
+                self.graphics
+                    .device
+                    .CreateShaderResourceView(input, None, Some(&mut srv))?;
+                self.input_srv = srv;
+                self.input_texture = Some(input.clone());
+            }
             let c = &self.graphics.context;
             c.OMSetRenderTargets(Some(std::slice::from_ref(&self.rtv)), None);
             c.OMSetBlendState(None, Some(&[0.0; 4]), u32::MAX);
@@ -505,7 +796,7 @@ impl Readback {
             c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&self.vertex, None);
             c.PSSetShader(&self.pixel, None);
-            c.PSSetShaderResources(0, Some(&[srv]));
+            c.PSSetShaderResources(0, Some(std::slice::from_ref(&self.input_srv)));
             c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             c.Draw(3, 0);
             c.PSSetShaderResources(0, Some(&[None]));

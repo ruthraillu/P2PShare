@@ -84,7 +84,7 @@ fn worker(
     }
     let _apartment = Apartment;
     // Create the GPU device lazily on the first picker request.
-    let mut state: Option<(GraphicsDevice, egui_directx11::Renderer)> = None;
+    let mut state: Option<(GraphicsDevice, egui_directx11::Renderer, egui::Context)> = None;
     let mut sources = Vec::new();
     let mut g = 0;
     loop {
@@ -118,18 +118,19 @@ fn worker(
         if state.is_none() {
             let graphics = GraphicsDevice::new()?;
             let renderer = egui_directx11::Renderer::new(&graphics.device)?;
-            state = Some((graphics, renderer));
+            let ctx = egui::Context::default();
+            state = Some((graphics, renderer, ctx));
         }
         // Consume each source exactly once, then sleep until the picker reopens.
         let source = sources.pop().unwrap();
-        let (graphics, renderer) = state.as_mut().unwrap();
+        let (graphics, renderer, ctx) = state.as_mut().unwrap();
         let mut capture = WindowsCapture::new(graphics.clone());
         let result = (|| -> anyhow::Result<Option<egui::ColorImage>> {
             capture.start(&source)?;
             let deadline = Instant::now() + Duration::from_millis(350);
             while Instant::now() < deadline && generation.load(Ordering::Acquire) == g {
                 if let Some(frame) = capture.poll_frame()? {
-                    return Ok(Some(downscale(graphics, renderer, &frame.texture)?));
+                    return Ok(Some(downscale(graphics, renderer, ctx, &frame.texture)?));
                 }
                 std::thread::sleep(Duration::from_millis(8));
             }
@@ -164,19 +165,25 @@ fn send_snapshot(
 fn downscale(
     graphics: &GraphicsDevice,
     renderer: &mut egui_directx11::Renderer,
+    ctx: &egui::Context,
     source: &ID3D11Texture2D,
 ) -> anyhow::Result<egui::ColorImage> {
-    render_thumbnail(graphics, renderer, source, W, H)
+    render_thumbnail(graphics, renderer, ctx, source, W, H)
 }
 pub(crate) fn jpeg_snapshot(
     graphics: &GraphicsDevice,
     renderer: &mut egui_directx11::Renderer,
+    ctx: &egui::Context,
     source: &ID3D11Texture2D,
 ) -> anyhow::Result<Vec<u8>> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe {
         source.GetDesc(&mut desc);
     }
+    anyhow::ensure!(
+        desc.Width > 0 && desc.Height > 0,
+        "Cannot snapshot zero-sized texture"
+    );
     let max = p2pshare_media::preview::MAX_EDGE;
     let size = if desc.Width <= max && desc.Height <= max {
         p2pshare_media::Dimensions::new(desc.Width, desc.Height)
@@ -184,18 +191,25 @@ pub(crate) fn jpeg_snapshot(
         p2pshare_media::Dimensions::new(desc.Width, desc.Height)
             .fit(p2pshare_media::Dimensions::new(max, max))
     };
-    let image = render_thumbnail(graphics, renderer, source, size.width, size.height)?;
+    let image = render_thumbnail(graphics, renderer, ctx, source, size.width, size.height)?;
     let rgba: Vec<_> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
     p2pshare_media::preview::encode(size.width, size.height, &rgba)
 }
 fn render_thumbnail(
     graphics: &GraphicsDevice,
     renderer: &mut egui_directx11::Renderer,
+    ctx: &egui::Context,
     source: &ID3D11Texture2D,
     width: u32,
     height: u32,
 ) -> anyhow::Result<egui::ColorImage> {
     unsafe {
+        let mut original = D3D11_TEXTURE2D_DESC::default();
+        source.GetDesc(&mut original);
+        anyhow::ensure!(
+            original.Width > 0 && original.Height > 0 && width > 0 && height > 0,
+            "Cannot render thumbnail with zero dimensions"
+        );
         let mut srv = None;
         graphics
             .device
@@ -226,11 +240,8 @@ fn render_thumbnail(
                 .device
                 .CreateRenderTargetView(&texture, None, Some(&mut target))?;
             let target = target.unwrap();
-            let mut original = D3D11_TEXTURE2D_DESC::default();
-            source.GetDesc(&mut original);
             let scale =
                 (width as f32 / original.Width as f32).min(height as f32 / original.Height as f32);
-            let ctx = egui::Context::default();
             let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -259,7 +270,7 @@ fn render_thumbnail(
                 .context
                 .ClearRenderTargetView(&target, &[0.025, 0.025, 0.035, 1.]);
             let (render, _, _) = egui_directx11::split_output(output);
-            renderer.render(&graphics.context, &target, &ctx, render)?;
+            renderer.render(&graphics.context, &target, ctx, render)?;
             graphics.context.OMSetRenderTargets(None, None);
             let mut staging = None;
             let cpu = D3D11_TEXTURE2D_DESC {
@@ -357,10 +368,11 @@ mod tests {
                 .unwrap();
             g.context
                 .ClearRenderTargetView(&target.unwrap(), &[0.9, 0.1, 0.2, 1.]);
-            let jpeg = jpeg_snapshot(&g, &mut renderer, &texture).unwrap();
+            let ctx = egui::Context::default();
+            let jpeg = jpeg_snapshot(&g, &mut renderer, &ctx, &texture).unwrap();
             let preview = p2pshare_media::preview::decode(&jpeg).unwrap();
             assert_eq!((preview.width, preview.height), (512, 384));
-            let image = downscale(&g, &mut renderer, &texture).unwrap();
+            let image = downscale(&g, &mut renderer, &ctx, &texture).unwrap();
             let center = image.pixels[(H / 2 * W + W / 2) as usize];
             assert!(center.r() > 210 && center.g() < 40 && center.b() > 40);
             let edge = image.pixels[(H / 2 * W) as usize];

@@ -140,6 +140,7 @@ pub struct App {
     pub signaling_setup: Option<String>,
     pub update: Option<crate::updates::Notice>,
     pub update_open: bool,
+    pub firewall_open: bool,
     pub avatars:HashMap<u64,egui::TextureId>,
     pub profile_view:Option<u64>,
     pub profile_nicknames: HashMap<u64, String>,
@@ -185,7 +186,7 @@ pub struct App {
     pub regions: Vec<(String, Rect)>,
     pub saves: usize,
     pub watching: std::collections::HashSet<u64>,
-    pub stream_viewers:HashMap<u64,Vec<String>>,
+    pub stream_viewers:HashMap<u64,Vec<(u64,String)>>,
     pub local_preview_hidden: bool,
 }
 pub fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
@@ -239,6 +240,7 @@ impl App {
             signaling_setup: None,
             update: None,
             update_open: false,
+            firewall_open: false,
             profile_nicknames: Default::default(),
             nickname_draft: None,
             nickname_save_failed: false,
@@ -484,7 +486,13 @@ impl App {
             self.signaling_dialog(ui);
             return;
         }
-        if self.dialog == Dialog::None && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.dialog == Dialog::None
+            && self.profile_view.is_none()
+            && self.profile_enlarged.is_none()
+            && !self.update_open
+            && !self.firewall_open
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
             if self.fullscreen {
                 self.fullscreen = false;
             } else {

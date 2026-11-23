@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /** Ordered, bounded MediaCodec input on a worker; OES texture updates stay on the EGL thread. */
 final class VideoDecoder {
     private static final HashMap<String,VideoDecoder> decoders=new HashMap<>();
+    private static boolean foreground=true;
     private static final HandlerThread callbacks;
     private static final Handler handler;
     private static final Handler surfaceHandler;
@@ -77,8 +78,15 @@ final class VideoDecoder {
             if(surface!=null) surface.release();if(texture!=null) texture.release();throw error;
         }
     }
+    static synchronized void setForeground(boolean active) {
+        foreground=active;
+        if(!active) {
+            for(String peer:new java.util.ArrayList<>(decoders.keySet())) remove(peer);
+        }
+    }
     static synchronized boolean create(String peer,int texture,int w,int h,String mime) {
         remove(peer);
+        if(!foreground) return false;
         try { failures.remove(peer);decoders.put(peer,new VideoDecoder(texture,w,h,mime));return true; }
         catch(Exception e) { failures.put(peer,"Cannot decode "+mime+": "+e);android.util.Log.e("P2PShare","Decoder creation",e);DebugLog.record("decoder_creation_error mime="+mime+" "+e);return false; }
     }
@@ -108,7 +116,13 @@ final class VideoDecoder {
         if(pendingOutput>=0 && !closed && surfacePending.compareAndSet(false,true)) {
             int output=pendingOutput;pendingOutput=-1;
             surfaceReceivedNs.set(pendingReceivedNs);
-            codec.releaseOutputBuffer(output,System.nanoTime());
+            try {
+                codec.releaseOutputBuffer(output,System.nanoTime());
+            } catch(RuntimeException error) {
+                surfacePending.set(false);
+                available.set(false);
+                throw error;
+            }
         }
     }
     private synchronized void pump() {
@@ -125,10 +139,11 @@ final class VideoDecoder {
                 buffer.clear();buffer.put(next.data);codec.queueInputBuffer(index,0,next.data.length,next.micros,0);
                 inputs.remove();inFlight++;
             }
-            drain();report();if(!inputs.isEmpty() || inFlight>0 || pendingOutput>=0) schedule(3);
+            drain();report();
+            if(!inputs.isEmpty() || inFlight>0 || (pendingOutput>=0 && !surfacePending.get())) schedule(3);
         } catch(Exception error) {
             android.util.Log.e("P2PShare","Decoder pump",error);DebugLog.record("decoder_error "+error);
-            inputs.lost();timings.clear();inFlight=0;pendingOutput=-1;recovery=true;recoveries++;try { codec.flush(); } catch(Exception ignored) {}
+            inputs.lost();timings.clear();inFlight=0;pendingOutput=-1;surfacePending.set(false);available.set(false);recovery=true;recoveries++;try { codec.flush(); } catch(Exception ignored) {}
         }
     }
     static boolean feed(String peer,byte[] data,long micros,boolean keyframe) { return feed(peer,data,micros,keyframe,0); }

@@ -224,7 +224,7 @@ impl Discovery {
                     if notices.is_closed() {
                         break;
                     }
-                    if connected.is_ok() {
+                    if matches!(connected, Ok(true)) {
                         delay = 2;
                     }
                     tokio::time::sleep(
@@ -324,15 +324,23 @@ async fn next_presence(
     address: PeerAddress,
     clock: &PublishClock,
 ) -> Result<Event> {
-    let mut state = clock.lock().await;
-    let current = now();
-    if state.0 >= current {
-        tokio::time::sleep(Duration::from_secs(state.0 - current + 1)).await;
-    }
-    let created = now();
+    // Never hold PublishClock across sleep or blocking disk I/O.
+    let (created, path) = loop {
+        let wait = {
+            let mut state = clock.lock().await;
+            let current = now();
+            if current > state.0 {
+                state.0 = current;
+                break (current, state.1.clone());
+            }
+            state.0 - current + 1
+        };
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    };
     let event = signed_presence_at(invite, keys, &Presence::new(address), created)?;
-    std::fs::write(&state.1, created.to_be_bytes())?;
-    state.0 = created;
+    tokio::task::spawn_blocking(move || std::fs::write(path, created.to_be_bytes()))
+        .await
+        .context("Presence clock writer task failed")??;
     Ok(event)
 }
 #[allow(clippy::too_many_arguments)]
@@ -344,7 +352,8 @@ async fn relay_session(
     mut address: watch::Receiver<PeerAddress>,
     notices: &mpsc::Sender<Notice>,
     clock: &PublishClock,
-) -> Result<()> {
+) -> Result<bool> {
+    let started = tokio::time::Instant::now();
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(12),
         ClientBuilder::new()
@@ -354,7 +363,15 @@ async fn relay_session(
     )
     .await??;
     let sub = "p2pshare-v4";
-    socket.send(Message::text(json!(["REQ",sub,{"kinds":[KIND],"#t":[invite.topic()?],"since":now().saturating_sub(LEASE+30),"limit":64}]).to_string())).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.send(Message::text(
+            json!(["REQ",sub,{"kinds":[KIND],"#t":[invite.topic()?],"since":now().saturating_sub(LEASE+30),"limit":64}])
+                .to_string(),
+        )),
+    )
+    .await
+    .context("Discovery subscription send timed out")??;
     let mut heartbeat =
         tokio::time::interval(Duration::from_secs(20 + rand::random::<u8>() as u64 % 5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -373,16 +390,24 @@ async fn relay_session(
                 let event = next_presence(invite, keys, current, clock).await?;
                 pending_id = event.id.to_hex(); accepted = false;
                 deadline = tokio::time::Instant::now()+Duration::from_secs(15);
-                socket.send(Message::text(json!(["EVENT",event]).to_string())).await?;
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    socket.send(Message::text(json!(["EVENT",event]).to_string())),
+                )
+                .await
+                .context("Discovery presence send timed out")??;
             }
             changed = address.changed() => {
-                if changed.is_err() { return Ok(()); }
+                if changed.is_err() { return Ok(true); }
                 // Beat immediately so changed Iroh addresses reach new joiners.
                 heartbeat.reset_immediately();
             }
             message = socket.next() => {
                 let message = message.context("Discovery disconnected")??;
-                if message.is_close() { return Ok(()); }
+                if message.is_close() {
+                    // Do not reset reconnect backoff if the relay closed immediately.
+                    return Ok(accepted && started.elapsed() >= Duration::from_secs(30));
+                }
                 let Some(text) = message.as_text() else { continue; };
                 let Ok(value) = serde_json::from_str::<Value>(text) else { continue; };
                 match value[0].as_str() {

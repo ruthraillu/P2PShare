@@ -56,14 +56,42 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:RUSTUP_TOOLCHAIN = 'stable'
           .\tools\setup-android.ps1
+      - name: Run Android decoder unit tests
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'android-decoder-tests'
+          if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force }
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $testSources = @(Get-ChildItem -LiteralPath 'apps/android/tests/decoder' -Filter '*.java' -Recurse | ForEach-Object FullName)
+          $prodSources = @(
+            (Resolve-Path 'apps/android/java/org/p2pshare/test/DebugLog.java').Path,
+            (Resolve-Path 'apps/android/java/org/p2pshare/test/DecoderQueue.java').Path,
+            (Resolve-Path 'apps/android/java/org/p2pshare/test/VideoDecoder.java').Path
+          )
+          & javac -encoding UTF-8 -d $out @testSources @prodSources
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & java -ea -cp $out org.p2pshare.test.DecoderQueueTest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & java -ea -cp $out org.p2pshare.test.VideoDecoderTest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build Android ARM64 APK
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') }}
+          TAG: ${{ github.ref_name }}
           P2PSHARE_ANDROID_SIGNING_KEY: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_SIGNING_KEY || '' }}
+          P2PSHARE_ANDROID_KEYSTORE_PASS: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_KEYSTORE_PASS || '' }}
+          P2PSHARE_ANDROID_KEY_ALIAS: ${{ github.event_name == 'push' && github.event.created && startsWith(github.ref, 'refs/tags/v') && secrets.P2PSHARE_ANDROID_KEY_ALIAS || '' }}
         run: |
           $env:RUSTUP_TOOLCHAIN = 'stable'
           if ($env:RELEASE_TAG -eq 'true') {
+            $cargoToml = Get-Content -LiteralPath 'Cargo.toml' -Raw
+            $verMatch = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\][^\[]*?^\s*version\s*=\s*"([^"]+)"')
+            if (-not $verMatch.Success) { throw 'Could not read workspace.package.version from Cargo.toml.' }
+            $workspaceVersion = $verMatch.Groups[1].Value
+            if ($env:TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or $env:TAG -ne "v$workspaceVersion") {
+              throw "Release tag '$($env:TAG)' must match ^v[0-9]+\.[0-9]+\.[0-9]+$ and equal Cargo.toml version 'v$workspaceVersion'."
+            }
             if (!$env:P2PSHARE_ANDROID_SIGNING_KEY) { throw 'Missing Android release signing secret.' }
             $key = Join-Path $env:RUNNER_TEMP 'p2pshare-android-release.p12'
             try {
@@ -78,6 +106,7 @@ jobs:
                 throw 'APK does not use the pinned release certificate.'
               }
             } finally {
+              Remove-Item Env:P2PSHARE_ANDROID_KEYSTORE_PASS -ErrorAction SilentlyContinue
               if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Force }
             }
           } else {

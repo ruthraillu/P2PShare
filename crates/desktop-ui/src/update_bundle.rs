@@ -362,6 +362,25 @@ fn prepare(home: &Path, target: &str, stage: &Path) -> Result<Journal> {
     Ok(journal)
 }
 
+fn retry_fs<F>(mut op: F) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(5) | Some(32))
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn rollback(home: &Path, stage: &Path, journal: &Journal) -> Result<()> {
     for (i, change) in journal.changes.iter().enumerate().rev() {
         let target = journal.path(home, &change.name)?;
@@ -382,9 +401,9 @@ fn rollback(home: &Path, stage: &Path, journal: &Journal) -> Result<()> {
             );
             let copy = stage.join("restoring");
             fs::copy(backup, &copy)?;
-            fs::rename(copy, &target)?;
+            retry_fs(|| fs::rename(&copy, &target))?;
         } else {
-            fs::remove_file(&target)?;
+            retry_fs(|| fs::remove_file(&target))?;
         }
     }
     Ok(())
@@ -392,7 +411,7 @@ fn rollback(home: &Path, stage: &Path, journal: &Journal) -> Result<()> {
 
 fn finalize(stage: &Path, transaction: &Path) -> Result<()> {
     fs::write(stage.join("installed"), [])?;
-    fs::remove_file(transaction)?;
+    retry_fs(|| fs::remove_file(transaction))?;
     Ok(())
 }
 
@@ -415,7 +434,7 @@ pub(super) fn install(
     file.sync_all()?;
     drop(file);
     ensure!(!transaction.exists(), "An earlier update requires recovery");
-    fs::rename(pending, &transaction)?;
+    retry_fs(|| fs::rename(&pending, &transaction))?;
     let result = (|| {
         for change in &journal.changes {
             let path = journal.path(home, &change.name)?;
@@ -425,9 +444,10 @@ pub(super) fn install(
             );
             if change.next.is_some() {
                 fs::create_dir_all(path.parent().unwrap())?;
-                fs::rename(stage.join("files").join(&change.name), path)?;
+                let src = stage.join("files").join(&change.name);
+                retry_fs(|| fs::rename(&src, &path))?;
             } else {
-                fs::remove_file(path)?;
+                retry_fs(|| fs::remove_file(&path))?;
             }
         }
         restart(&journal.path(home, EXE)?)
@@ -454,7 +474,7 @@ pub(super) fn recover(home: &Path, data: &Path) -> Result<()> {
     let journal: Journal = read_json(&transaction)?;
     journal.validate()?;
     let stage = updates.join(&journal.stage);
-    ensure!(stage.canonicalize()? == stage, "Invalid recovery stage");
+    ensure!(super::same_canonical_path(&stage)?, "Invalid recovery stage");
     let last = journal.changes.last().unwrap();
     let exe = digest_if_present(&journal.path(home, EXE)?)?;
     if exe != last.next {

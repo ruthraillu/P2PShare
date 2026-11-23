@@ -21,6 +21,60 @@ pub fn data_dir() -> io::Result<PathBuf> {
     .clone()
     .map_err(io::Error::other)
 }
+#[cfg(windows)]
+fn is_link_reparse_point(path: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct Win32FindDataW {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        file_size_high: u32,
+        file_size_low: u32,
+        reserved0: u32,
+        reserved1: u32,
+        file_name: [u16; 260],
+        alternate_file_name: [u16; 14],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FindFirstFileW(file_name: *const u16, find_file_data: *mut Win32FindDataW) -> isize;
+        fn FindClose(find_file: isize) -> i32;
+    }
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    while wide.len() > 1
+        && matches!(wide.last(), Some(&0x005C | &0x002F))
+        && wide[wide.len() - 2] != b':' as u16
+    {
+        wide.pop();
+    }
+    wide.push(0);
+
+    let mut data: Win32FindDataW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        FindClose(handle);
+    }
+    Ok(matches!(
+        data.reserved0,
+        IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT
+    ))
+}
 fn regular(path: &Path) -> io::Result<Option<fs::Metadata>> {
     let m = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -30,7 +84,7 @@ fn regular(path: &Path) -> io::Result<Option<fs::Metadata>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if m.file_attributes() & 0x400 != 0 {
+        if m.file_attributes() & 0x400 != 0 && is_link_reparse_point(path)? {
             return Err(io::Error::other(format!(
                 "Cannot migrate linked data entry: {}",
                 path.display()

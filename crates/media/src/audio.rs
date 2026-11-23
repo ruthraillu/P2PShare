@@ -175,7 +175,7 @@ impl Mixer {
                     decoder: opus::Decoder::new(RATE, opus::Channels::Stereo)?,
                     packets: BTreeMap::new(),
                     next: None,
-                    start: released + self.buffer,
+                    start: released.checked_add(self.buffer).unwrap_or(released),
                     last: released,
                     missing: 0,
                 },
@@ -183,29 +183,38 @@ impl Mixer {
         }
         let voice = self.voices.get_mut(peer).unwrap();
         if released.saturating_duration_since(voice.last) > Duration::from_millis(200)
-            || voice.next.is_some_and(|n| micros > n + 200000)
+            || micros > u64::MAX - PACKET_US
+            || voice.next.is_some_and(|n| micros > n.saturating_add(200_000))
         {
             voice.decoder.reset_state()?;
             voice.packets.clear();
             voice.next = None;
-            voice.start = released + self.buffer;
+            voice.start = released.checked_add(self.buffer).unwrap_or(released);
             voice.missing = 0;
             self.stats.resets += 1;
+            if micros > u64::MAX - PACKET_US {
+                voice.last = released;
+                self.stats.received += 1;
+                return Ok(());
+            }
         }
         voice.last = released;
         self.stats.received += 1;
-        if voice.next.is_some_and(|n| micros + 100 < n) {
+        if voice.next.is_some_and(|n| micros.saturating_add(100) < n) {
             self.stats.late += 1;
             return Ok(());
         }
-        if voice.packets.len() >= 12 {
-            voice.packets.clear();
-            voice.next = None;
-            voice.start = released + self.buffer;
-            voice.decoder.reset_state()?;
-            self.stats.overflows += 1;
-        }
         voice.packets.insert(micros, (data, received));
+        let cap = ((self.buffer.as_millis() as usize / 10) + 12).max(16);
+        if voice.packets.len() > cap {
+            self.stats.overflows += 1;
+            while voice.packets.len() > cap {
+                voice.packets.pop_first();
+            }
+            if let Some(&oldest) = voice.packets.keys().next() {
+                voice.next = Some(voice.next.map_or(oldest, |n| n.max(oldest)));
+            }
+        }
         Ok(())
     }
     /// Exactly 10 ms, including silence. Called by the device-driven playback worker.
@@ -213,17 +222,28 @@ impl Mixer {
         out.fill(0.0);
         let mut pcm = [0.0; SAMPLES];
         for (peer, voice) in &mut self.voices {
-            if now < voice.start || voice.last.elapsed() > Duration::from_millis(200) {
+            if now < voice.start
+                || now.saturating_duration_since(voice.last) > Duration::from_millis(200)
+            {
                 continue;
             }
             let Some(first) = voice.packets.keys().next().copied().or(voice.next) else {
                 continue;
             };
             let next = voice.next.unwrap_or(first);
+            if next > u64::MAX - PACKET_US {
+                voice.next = None;
+                voice.packets.clear();
+                voice.start = now.checked_add(self.buffer).unwrap_or(now);
+                voice.missing = 0;
+                let _ = voice.decoder.reset_state();
+                self.stats.resets += 1;
+                continue;
+            }
             // RTP clock conversion can differ by one microsecond, so match with tolerance.
             let key = voice
                 .packets
-                .range(next.saturating_sub(100)..=next + 100)
+                .range(next.saturating_sub(100)..=next.saturating_add(100))
                 .next()
                 .map(|(k, _)| *k);
             let data = key.and_then(|k| voice.packets.remove(&k));
@@ -258,12 +278,15 @@ impl Mixer {
                     self.stats.concealed += 1;
                 }
             }
-            voice.next = Some(next + PACKET_US);
-            voice.packets.retain(|k, _| *k + 100 >= next + PACKET_US);
+            let next_pts = next.saturating_add(PACKET_US);
+            voice.next = Some(next_pts);
+            voice
+                .packets
+                .retain(|k, _| k.saturating_add(100) >= next_pts);
             if voice.missing >= 10 {
                 voice.next = None;
                 voice.packets.clear();
-                voice.start = now + self.buffer;
+                voice.start = now.checked_add(self.buffer).unwrap_or(now);
                 voice.missing = 0;
                 let _ = voice.decoder.reset_state();
             }

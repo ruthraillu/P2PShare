@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::Win32::System::Com::*;
+use windows::core::Interface;
 struct Apartment;
 impl Drop for Apartment {
     fn drop(&mut self) {
@@ -101,14 +102,40 @@ impl Device {
             } else {
                 None
             };
-            client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                flags | if process { 0x40000 } else { 0 },
-                if process { 0 } else { 200000 },
-                0,
-                &format,
-                None,
-            )?;
+            let init_flags = flags | if process { 0x40000 } else { 0 };
+            if process {
+                // Request a 40 ms buffer for process loopback if supported; fall back
+                // to the default duration (0) when rejected by the audio engine.
+                if client
+                    .Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        init_flags,
+                        400_000,
+                        0,
+                        &format,
+                        None,
+                    )
+                    .is_err()
+                {
+                    client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        init_flags,
+                        0,
+                        0,
+                        &format,
+                        None,
+                    )?;
+                }
+            } else {
+                client.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    init_flags,
+                    200_000,
+                    0,
+                    &format,
+                    None,
+                )?;
+            }
             if let Some(event) = &event {
                 client.SetEventHandle(event.0)?;
             }
@@ -166,7 +193,7 @@ impl Device {
                         pcm.extend(
                             std::slice::from_raw_parts(data.cast::<f32>(), samples)
                                 .iter()
-                                .copied(),
+                                .map(|&s| if s.is_finite() { s } else { 0.0 }),
                         );
                     }
                 }
@@ -177,26 +204,49 @@ impl Device {
     }
     fn render(&self, mixer: &mut Mixer, underruns: &mut u64) -> Result<()> {
         unsafe {
-            let padding = self.client.GetCurrentPadding()?;
-            if padding == 0 {
-                *underruns += 1;
-            }
-            // Keep at most 20 ms queued at the device. Never queue stale seconds of audio.
-            let available = self
-                .capacity
-                .saturating_sub(padding)
-                .min((FRAMES * 2) as u32);
-            if available < FRAMES as u32 || padding > FRAMES as u32 {
-                return Ok(());
-            }
             let render = self.render.as_ref().context("Missing output")?;
-            let mut pcm = [0.0; SAMPLES];
-            mixer.render(Instant::now(), &mut pcm);
-            let data = render.GetBuffer(FRAMES as u32)?;
-            std::ptr::copy_nonoverlapping(pcm.as_ptr(), data.cast::<f32>(), SAMPLES);
-            render.ReleaseBuffer(FRAMES as u32, 0)?;
+            let mut first = true;
+            // Keep at most 20 ms queued at the device. Never queue stale seconds of audio.
+            for _ in 0..4 {
+                let padding = self.client.GetCurrentPadding()?;
+                if first && padding == 0 {
+                    *underruns += 1;
+                }
+                first = false;
+                let available = self.capacity.saturating_sub(padding);
+                if available < FRAMES as u32 || padding > FRAMES as u32 {
+                    break;
+                }
+                let mut pcm = [0.0; SAMPLES];
+                mixer.render(Instant::now(), &mut pcm);
+                let data = render.GetBuffer(FRAMES as u32)?;
+                std::ptr::copy_nonoverlapping(pcm.as_ptr(), data.cast::<f32>(), SAMPLES);
+                render.ReleaseBuffer(FRAMES as u32, 0)?;
+            }
         }
         Ok(())
+    }
+}
+fn default_render_endpoint_id() -> Option<String> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let mut id_ptr: *mut u16 = std::ptr::null_mut();
+        let get_id: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *mut *mut u16,
+        ) -> windows::core::HRESULT = std::mem::transmute(device.vtable().GetId);
+        if get_id(device.as_raw(), &mut id_ptr).is_err() || id_ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *id_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let id = String::from_utf16_lossy(std::slice::from_raw_parts(id_ptr, len));
+        CoTaskMemFree(Some(id_ptr.cast()));
+        Some(id)
     }
 }
 impl Drop for Device {
@@ -282,6 +332,9 @@ fn run(
     let mut output: Option<Device> = None;
     let mut captured = VecDeque::new();
     let mut pts = 0;
+    let timer = HighResTimer::new();
+    let mut default_endpoint = default_render_endpoint_id();
+    let mut endpoint_check = Instant::now();
     let mut capture_retry = Instant::now();
     let mut playback_retry = Instant::now();
     let mut report = Instant::now();
@@ -305,6 +358,27 @@ fn run(
             capture_retry = Instant::now();
             capture_target = target;
             tracing::info!(?target, "audio_capture_target_changed");
+        }
+        if endpoint_check.elapsed() >= Duration::from_secs(1) {
+            endpoint_check = Instant::now();
+            let current = default_render_endpoint_id();
+            if current.is_some() && current != default_endpoint {
+                tracing::info!(
+                    previous = ?default_endpoint,
+                    current = ?current,
+                    "default_audio_endpoint_changed"
+                );
+                default_endpoint = current;
+                if output.is_some() {
+                    output = None;
+                    playback_retry = Instant::now();
+                }
+                if input.as_ref().is_some_and(|i| !i.excludes_own_playback()) {
+                    input = None;
+                    captured.clear();
+                    capture_retry = Instant::now();
+                }
+            }
         }
         if membership.elapsed() >= Duration::from_millis(20) {
             membership = Instant::now();
@@ -347,7 +421,17 @@ fn run(
                     input = Some(device);
                     captured.clear();
                     pts = session.media_micros();
-                    encoder.reset_state()?;
+                    if let Err(error) = encoder.reset_state() {
+                        tracing::warn!(%error, "audio_encoder_reset_failed");
+                        match p2pshare_media::audio::encoder(config) {
+                            Ok(fresh) => encoder = fresh,
+                            Err(recreate_error) => {
+                                tracing::error!(%recreate_error, "audio_encoder_recreate_failed");
+                                input = None;
+                                capture_retry = Instant::now() + Duration::from_secs(5);
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::error!(%error, ?target, "audio_capture_start_failed");
@@ -355,11 +439,20 @@ fn run(
                 }
             }
         }
+        let mut reset_input = false;
         if let Some(device) = &mut input {
-            if let Err(error) = device.capture(&mut captured,&mut pts) {
-                tracing::warn!(%error,"audio_capture_failed");
-                input = None;
-                capture_retry = Instant::now() + Duration::from_secs(1);
+            if let Err(error) = device.capture(&mut captured, &mut pts) {
+                tracing::warn!(%error, "audio_capture_failed");
+                reset_input = true;
+            }
+            if !reset_input && matches!(device, CaptureInput::Plain(_)) && !captured.is_empty() {
+                let now_micros = session.media_micros();
+                let buffered_us = (captured.len() / 2) as u64 * 1_000_000 / RATE as u64;
+                if now_micros > pts.saturating_add(buffered_us).saturating_add(100_000) {
+                    let new_pts = now_micros.saturating_sub(buffered_us);
+                    tracing::debug!(old_pts = pts, new_pts, "audio_pts_reanchored");
+                    pts = new_pts;
+                }
             }
             if captured.len() > SAMPLES * 8 {
                 let dropped = captured.len() / SAMPLES - 2;
@@ -368,21 +461,38 @@ fn run(
                 capture_drops += dropped as u64;
                 tracing::warn!(dropped, "audio_capture_queue_trimmed");
             }
-            while captured.len() >= SAMPLES {
+            while !reset_input && captured.len() >= SAMPLES {
                 let mut pcm = [0.0; SAMPLES];
                 for s in &mut pcm {
                     *s = captured.pop_front().unwrap();
                 }
                 let started = Instant::now();
-                let data = encoder.encode_vec_float(&pcm, 1275)?;
-                encode_latency.record(started.elapsed().as_secs_f64() * 1000.);
-                session.publish_audio(AudioPacket {
-                    data: data.into(),
-                    micros: pts,
-                });
-                pts += PACKET_US;
-                encoded += 1;
+                match encoder.encode_vec_float(&pcm, 1275) {
+                    Ok(data) => {
+                        encode_latency.record(started.elapsed().as_secs_f64() * 1000.);
+                        session.publish_audio(AudioPacket {
+                            data: data.into(),
+                            micros: pts,
+                        });
+                        pts += PACKET_US;
+                        encoded += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "audio_encode_failed");
+                        if let Ok(fresh) = p2pshare_media::audio::encoder(config) {
+                            encoder = fresh;
+                        } else {
+                            let _ = encoder.reset_state();
+                        }
+                        captured.clear();
+                        reset_input = true;
+                    }
+                }
             }
+        }
+        if reset_input {
+            input = None;
+            capture_retry = Instant::now() + Duration::from_secs(1);
         }
         for packet in session.take_audio() {
             if let Err(error) = mixer.push_released(
@@ -434,13 +544,16 @@ fn run(
             }
             report = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(
-            if input.is_some() || output.is_some() {
-                2
-            } else {
-                10
-            },
-        ));
+        let wait = Duration::from_millis(if input.is_some() || output.is_some() {
+            2
+        } else {
+            10
+        });
+        if let Some(timer) = &timer {
+            timer.sleep(wait);
+        } else {
+            std::thread::sleep(wait);
+        }
     }
     Ok(())
 }
@@ -524,6 +637,66 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         Ok(())
+    }
+}
+
+struct HighResTimer(*mut std::ffi::c_void);
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateWaitableTimerExW(
+        attributes: *const std::ffi::c_void,
+        name: *const u16,
+        flags: u32,
+        desired_access: u32,
+    ) -> *mut std::ffi::c_void;
+    fn SetWaitableTimer(
+        timer: *mut std::ffi::c_void,
+        due_time: *const i64,
+        period: i32,
+        completion: *const std::ffi::c_void,
+        arg: *const std::ffi::c_void,
+        resume: i32,
+    ) -> i32;
+}
+impl HighResTimer {
+    fn new() -> Option<Self> {
+        const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+        const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self(handle))
+        }
+    }
+    fn sleep(&self, duration: Duration) {
+        let ticks = -((duration.as_nanos() / 100).max(1) as i64);
+        unsafe {
+            if SetWaitableTimer(self.0, &ticks, 0, std::ptr::null(), std::ptr::null(), 0) != 0 {
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(
+                    windows::Win32::Foundation::HANDLE(self.0),
+                    duration.as_millis().saturating_add(50) as u32,
+                );
+                return;
+            }
+        }
+        std::thread::sleep(duration);
+    }
+}
+impl Drop for HighResTimer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(
+                windows::Win32::Foundation::HANDLE(self.0),
+            );
+        }
     }
 }
 

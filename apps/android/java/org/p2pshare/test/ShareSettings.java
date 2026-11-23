@@ -15,18 +15,45 @@ final class ShareSettings {
   Spinner fps=spinner(a,box,L10n.t("Frame rate"),new String[]{"30","60","90","120"},p.getInt("fps",0));
   EditText bitrate=number(a,box,L10n.t("Video bitrate (kbps, 100–50000)"),p.getInt("bitrate",6000));
   CheckBox audio=new CheckBox(a);audio.setText(L10n.t("Share playback audio (Android 10+) — no microphone"));audio.setChecked(p.getBoolean("audio",true));audio.setEnabled(Build.VERSION.SDK_INT>=29);box.addView(audio);
-  ArrayList<String> names=new ArrayList<>();ArrayList<Integer> uids=new ArrayList<>();names.add(L10n.t("All media / game audio (even with single-app video)"));uids.add(-1);
+  PackageManager pm=a.getPackageManager();
   Intent launcher=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-  ArrayList<ResolveInfo> apps=new ArrayList<>(a.getPackageManager().queryIntentActivities(launcher,0));apps.sort((x,y)->x.loadLabel(a.getPackageManager()).toString().compareToIgnoreCase(y.loadLabel(a.getPackageManager()).toString()));
-  HashSet<Integer> seen=new HashSet<>();for(ResolveInfo app:apps){int uid=app.activityInfo.applicationInfo.uid;if(uid==a.getApplicationInfo().uid||!seen.add(uid))continue;names.add(app.loadLabel(a.getPackageManager()).toString());uids.add(uid);}
-  AudioSourcePicker source=new AudioSourcePicker(a,box,names,uids,p.getInt("uid",-1));
+  List<ResolveInfo> rawApps=pm.queryIntentActivities(launcher,0);
+  class AppEntry {
+   final String label;
+   final String pkg;
+   final int uid;
+   AppEntry(String label,String pkg,int uid){this.label=label;this.pkg=pkg;this.uid=uid;}
+  }
+  ArrayList<AppEntry> entries=new ArrayList<>(rawApps.size());
+  HashSet<Integer> seen=new HashSet<>();
+  int ownUid=a.getApplicationInfo().uid;
+  for(ResolveInfo app:rawApps){
+   if(app.activityInfo==null||app.activityInfo.applicationInfo==null)continue;
+   int uid=app.activityInfo.applicationInfo.uid;
+   if(uid==ownUid||!seen.add(uid))continue;
+   entries.add(new AppEntry(app.loadLabel(pm).toString(),app.activityInfo.applicationInfo.packageName,uid));
+  }
+  entries.sort((x,y)->x.label.compareToIgnoreCase(y.label));
+  ArrayList<String> names=new ArrayList<>(entries.size()+1);ArrayList<Integer> uids=new ArrayList<>(entries.size()+1);
+  HashMap<Integer,String> uidToPkg=new HashMap<>();
+  names.add(L10n.t("All media / game audio (even with single-app video)"));uids.add(-1);
+  for(AppEntry entry:entries){names.add(entry.label);uids.add(entry.uid);uidToPkg.put(entry.uid,entry.pkg);}
+  int selectedUid=-1;
+  String savedPkg=p.getString("audio_pkg",null);
+  if(savedPkg!=null){
+   if(!savedPkg.isEmpty()){try{selectedUid=pm.getPackageUid(savedPkg,0);}catch(Exception ignored){selectedUid=-1;}}
+  }else{
+   selectedUid=p.getInt("uid",-1);
+  }
+  AudioSourcePicker source=new AudioSourcePicker(a,box,names,uids,selectedUid);
   EditText opus=number(a,box,L10n.t("Opus audio bitrate (kbps, 64–512)"),p.getInt("opus",192));
   TextView note=new TextView(a);note.setText(L10n.t("Some apps prohibit audio capture. Video and audio sources are independent. Encoder support and attainable FPS depend on your phone. Continue to select a new screen or app; connected viewers keep watching."));box.addView(note);
   ScrollView scroll=new ScrollView(a);scroll.addView(box);
   AlertDialog dialog=new AlertDialog.Builder(a).setTitle(L10n.t("Share screen settings")).setView(scroll).setPositiveButton(L10n.t("Continue"),null).setNegativeButton(L10n.t("Cancel"),null).create();
   dialog.setOnShowListener(d->dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v->{try{
     int b=Integer.parseInt(bitrate.getText().toString()),o=Integer.parseInt(opus.getText().toString());if(b<100||b>50000||o<64||o>512)throw new IllegalArgumentException();
-    p.edit().putInt("codec",codec.getSelectedItemPosition()).putInt("res",res.getSelectedItemPosition()).putInt("fps",fps.getSelectedItemPosition()).putInt("bitrate",b).putInt("opus",o).putInt("uid",source.uid()).putBoolean("audio",audio.isChecked()&&Build.VERSION.SDK_INT>=29).apply();dialog.dismiss();a.requestShareConsent();
+    int chosenUid=source.uid();String chosenPkg=chosenUid>=0?uidToPkg.get(chosenUid):null;if(chosenPkg==null)chosenPkg="";
+    p.edit().putInt("codec",codec.getSelectedItemPosition()).putInt("res",res.getSelectedItemPosition()).putInt("fps",fps.getSelectedItemPosition()).putInt("bitrate",b).putInt("opus",o).putInt("uid",chosenUid).putString("audio_pkg",chosenPkg).putBoolean("audio",audio.isChecked()&&Build.VERSION.SDK_INT>=29).apply();dialog.dismiss();a.requestShareConsent();
    }catch(Exception e){Toast.makeText(a,L10n.t("Check bitrate ranges"),Toast.LENGTH_LONG).show();}}));dialog.show();
  }
  static Spinner spinner(Activity a,LinearLayout box,String label,String[] values,int selected){TextView t=new TextView(a);t.setText(label);box.addView(t);Spinner s=new Spinner(a);s.setAdapter(new ArrayAdapter<String>(a,android.R.layout.simple_spinner_dropdown_item,values));s.setSelection(Math.min(Math.max(0,selected),values.length-1));box.addView(s);return s;}
