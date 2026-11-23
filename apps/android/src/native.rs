@@ -171,6 +171,7 @@ static ACTIVE_SESSION: OnceLock<Mutex<Option<std::sync::Weak<Session>>>> = OnceL
 static CONFIG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static EDITED_ROOM: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static EDITED_SIGNALING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn read_config_string(path: &std::path::Path) -> std::io::Result<String> {
     let _guard = CONFIG_LOCK.lock().unwrap();
@@ -238,6 +239,24 @@ pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeRoomEdited(
 ) {
     if let Ok(room) = env.get_string(&room) {
         *EDITED_ROOM.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(room.into());
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_p2pshare_test_P2PShareActivity_nativeSignalingEdited(
+    mut env: JNIEnv,
+    _class: JClass,
+    url: JString,
+) {
+    if let Ok(url) = env.get_string(&url) {
+        let url: String = url.into();
+        *EDITED_SIGNALING
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(url.trim().chars().take(2048).collect());
+        let repaint = platform_input().lock().unwrap().repaint.clone();
+        if let Some(ctx) = repaint {
+            ctx.request_repaint();
+        }
     }
 }
 #[unsafe(no_mangle)]
@@ -326,6 +345,18 @@ impl Bridge {
                 "editRoom",
                 "(Ljava/lang/String;)V",
                 &[JValue::Object(room.as_ref())],
+            )?;
+            Ok(())
+        });
+    }
+    fn edit_signaling(&self, url: &str) {
+        let _ = self.env(|env| {
+            let url = env.new_string(url)?;
+            env.call_method(
+                self.activity.as_obj(),
+                "editSignaling",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(url.as_ref())],
             )?;
             Ok(())
         });
@@ -422,6 +453,9 @@ impl Bridge {
                     &[],
                 )?
                 .l()?;
+            if s.is_null() {
+                return Ok(String::new());
+            }
             let value = env.get_string(&JString::from(s))?.into();
             Ok(value)
         })
@@ -844,6 +878,18 @@ impl eframe::App for AndroidUi {
         {
             self.room.room_name = room;
         }
+        if let Some(url) = EDITED_SIGNALING
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .take()
+        {
+            self.room.signaling_server = url;
+            self.room.signaling_setup_error.clear();
+            if self.room.status == "Clipboard is empty" {
+                self.room.status.clear();
+            }
+        }
         if let Some(name) = edited_name().lock().unwrap().take() {
             let _ = update_config(|config| {
                 config.username = name.clone();
@@ -1085,6 +1131,21 @@ impl eframe::App for AndroidUi {
                         Err(error) => self.room.signaling_setup_error = error.to_string(),
                     }
                 }
+                Action::PasteSignaling => {
+                    let pasted = self.bridge.paste();
+                    let trimmed = pasted.trim();
+                    if trimmed.is_empty() {
+                        self.room.signaling_setup_error = "Clipboard is empty".into();
+                        self.room.status = "Clipboard is empty".into();
+                    } else {
+                        self.room.signaling_server = trimmed.chars().take(2048).collect();
+                        self.room.signaling_setup_error.clear();
+                        if self.room.status == "Clipboard is empty" {
+                            self.room.status.clear();
+                        }
+                    }
+                }
+                Action::EditSignaling(url) => self.bridge.edit_signaling(&url),
                 Action::SaveMobilePreferences { buffer_ms, server } => {
                     let result=(|| -> anyhow::Result<()> {
                         let playback = update_config(|config| {

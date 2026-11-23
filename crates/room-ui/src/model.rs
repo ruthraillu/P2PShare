@@ -28,6 +28,8 @@ pub enum Action {
     RemoveAvatar,
     SaveMobilePreferences { buffer_ms: u32, server: String },
     ConfigureSignaling(String),
+    PasteSignaling,
+    EditSignaling(String),
     ViewAndroidUpdate,
     PictureInPicture,
     LeaveRoom,

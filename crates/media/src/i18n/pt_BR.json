@@ -303,5 +303,8 @@
   "Diagnostics sent": "Diagnóstico enviado",
   "Running": "Em execução",
   "Completed": "Concluída",
-  "Ended unexpectedly": "Encerrada inesperadamente"
+  "Ended unexpectedly": "Encerrada inesperadamente",
+  "Paste": "Colar",
+  "Edit": "Editar",
+  "Clipboard is empty": "A área de transferência está vazia"
 }

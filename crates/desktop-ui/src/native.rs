@@ -875,7 +875,10 @@ impl View {
             | Action::EditName(_)
             | Action::EditRoom(_)
             | Action::EditConfig | Action::PictureInPicture | Action::SaveMobilePreferences { .. }
-            | Action::ConfigureSignaling(_) | Action::ViewAndroidUpdate => {}
+            | Action::ConfigureSignaling(_)
+            | Action::PasteSignaling
+            | Action::EditSignaling(_)
+            | Action::ViewAndroidUpdate => {}
             Action::NamedRoom { room, name } => {
                 self.session.command(Command::NamedRoom { room, name })
             }

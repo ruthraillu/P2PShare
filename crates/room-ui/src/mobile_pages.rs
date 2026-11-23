@@ -11,6 +11,26 @@ fn field(ui: &mut Ui, label: &str, value: &mut String, limit: usize) {
             .margin(vec2(10.0, 0.0)),
     );
 }
+fn signaling_field(ui: &mut Ui, label: &str, value: &mut String, actions: &mut Vec<Action>) {
+    field(ui, label, value, 2048);
+    ui.add_space(6.0);
+    let spacing = ui.spacing().item_spacing.x;
+    let half = ((ui.available_width() - spacing) / 2.0).max(72.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_sized([half, 40.0], egui::Button::new(p2pshare_media::tr!("Paste")))
+            .clicked()
+        {
+            actions.push(Action::PasteSignaling);
+        }
+        if ui
+            .add_sized([half, 40.0], egui::Button::new(p2pshare_media::tr!("Edit")))
+            .clicked()
+        {
+            actions.push(Action::EditSignaling(value.clone()));
+        }
+    });
+}
 impl RoomUi {
     pub(crate) fn mobile_pages(&mut self, root: &mut Ui, actions: &mut Vec<Action>) -> bool {
         if self.in_room && !self.room_dialog && !self.members_open {
@@ -57,7 +77,7 @@ impl RoomUi {
                     ui.heading(p2pshare_media::tr!("Signaling server"));
                     ui.label(RichText::new(p2pshare_media::tr!("Enter the WebSocket URL your group uses.")).color(MUTED));
                     ui.add_space(12.0);
-                    field(ui, "WebSocket URL", &mut self.signaling_server, 2048);
+                    signaling_field(ui, "WebSocket URL", &mut self.signaling_server, actions);
                     ui.add_space(12.0);
                     if ui.add_enabled(!self.signaling_server.trim().is_empty(),
                         egui::Button::new(p2pshare_media::tr!("Continue")).fill(ACCENT).min_size(vec2(ui.available_width(),44.0))).clicked()
@@ -65,7 +85,7 @@ impl RoomUi {
                         actions.push(Action::ConfigureSignaling(self.signaling_server.clone()));
                     }
                     if !self.signaling_setup_error.is_empty() {
-                        ui.label(RichText::new(&self.signaling_setup_error).color(egui::Color32::LIGHT_RED));
+                        ui.label(RichText::new(p2pshare_media::i18n::status(&self.signaling_setup_error)).color(egui::Color32::LIGHT_RED));
                     }
                 } else if self.room_dialog {
                     ui.horizontal(|ui|{
@@ -92,7 +112,7 @@ impl RoomUi {
                     ui.add_space(12.0);
                     if ui.add_enabled(!self.busy&&!self.room_name.trim().is_empty()&&!self.name.trim().is_empty(),egui::Button::new(p2pshare_media::tr!("Join room")).fill(ACCENT).min_size(vec2(ui.available_width(),44.0))).clicked(){actions.push(Action::NamedRoom{room:self.room_name.clone(),name:self.name.clone()});}
                     if !self.signaling_setup_error.is_empty() {
-                        ui.label(RichText::new(&self.signaling_setup_error).color(egui::Color32::LIGHT_RED));
+                        ui.label(RichText::new(p2pshare_media::i18n::status(&self.signaling_setup_error)).color(egui::Color32::LIGHT_RED));
                     }
                     ui.label(RichText::new(p2pshare_media::i18n::status(&self.status)).small().color(MUTED));
                 }
@@ -146,7 +166,7 @@ impl RoomUi {
         egui::Frame::new().fill(PANEL).corner_radius(8).inner_margin(10).show(ui,|ui|{
             ui.set_min_width(ui.available_width());
             egui::CollapsingHeader::new(p2pshare_media::tr!("Advanced")).show(ui,|ui|{
-                field(ui,p2pshare_media::tr!("Signaling server"),&mut self.signaling_server,2048);
+                signaling_field(ui,p2pshare_media::tr!("Signaling server"),&mut self.signaling_server,actions);
                 ui.label(RichText::new(p2pshare_media::tr!("Use the same server on every device. Restart after changing it.")).small().color(MUTED));
                 if ui.button(p2pshare_media::tr!("Edit config.toml")).clicked(){actions.push(Action::EditConfig);}
             });
@@ -164,7 +184,7 @@ impl RoomUi {
                     if ui.add_sized([ui.available_width(),44.0],egui::Button::new(p2pshare_media::tr!("Copy log"))).clicked(){actions.push(Action::CopyDebugLog);}
                     self.mobile_diagnostics(ui, actions);
                     ui.add_space(12.0);egui::CollapsingHeader::new(p2pshare_media::tr!("Advanced")).show(ui,|ui|{
-                        field(ui,p2pshare_media::tr!("Signaling server"),&mut self.signaling_server,2048);
+                        signaling_field(ui,p2pshare_media::tr!("Signaling server"),&mut self.signaling_server,actions);
                         ui.label(RichText::new(p2pshare_media::tr!("Use the same server on every device. Restart after changing it.")).small().color(MUTED));
                         if ui.button(p2pshare_media::tr!("Edit config.toml")).clicked(){actions.push(Action::EditConfig);}
                     });

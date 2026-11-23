@@ -638,3 +638,43 @@ fn language_prompt_blocks_room_and_emits_choice_once() {
  assert!(actions.iter().any(|a|matches!(a,Action::SetLanguage(p2pshare_media::i18n::Language::PtBr))));assert!(!room.language_prompt);assert_eq!(room.name,"Settings");assert_eq!(room.language,p2pshare_media::i18n::Language::PtBr);
  assert!(!frame(&ctx,&mut room,size,vec![]).iter().any(|a|matches!(a,Action::SetLanguage(_))));
 }
+
+#[test]
+fn android_signaling_setup_exposes_paste_and_native_edit_buttons() {
+    for size in [vec2(393.0, 852.0), vec2(852.0, 393.0)] {
+        let ctx = egui::Context::default();
+        RoomUi::configure(&ctx);
+        let mut room = RoomUi::new(false);
+        room.set_platform(p2pshare_room_ui::Platform::Android);
+        room.signaling_setup = true;
+        room.signaling_server = "wss://example.workers.dev".into();
+        let out = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                focused: true,
+                ..Default::default()
+            },
+            |ui| {
+                room.ui(ui);
+            },
+        );
+        let button_pos = |label: &str| {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == label => {
+                        Some(t.pos + t.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_else(|| panic!("Missing {label} button on size {size:?}"))
+        };
+        let paste_pos = button_pos("Paste");
+        let edit_pos = button_pos("Edit");
+        let paste_actions = click(&ctx, &mut room, size, paste_pos);
+        assert!(paste_actions.contains(&Action::PasteSignaling));
+        let edit_actions = click(&ctx, &mut room, size, edit_pos);
+        assert!(edit_actions.contains(&Action::EditSignaling("wss://example.workers.dev".into())));
+    }
+}

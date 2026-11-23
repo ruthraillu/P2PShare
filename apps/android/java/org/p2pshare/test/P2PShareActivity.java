@@ -70,6 +70,7 @@ public final class P2PShareActivity extends NativeActivity {
     public static native void nativeLeaveRoom();
     public static native void nativeForeground(boolean active);
     public static native void nativeRoomEdited(String room);
+    public static native void nativeSignalingEdited(String url);
     public static native String nativeSaveConfig(String text);
     private volatile boolean pipAvailable;
     private boolean pipSession;
@@ -216,11 +217,76 @@ public final class P2PShareActivity extends NativeActivity {
         return super.dispatchKeyEvent(event);
     }
     @Override public void onBackPressed() {if(Build.VERSION.SDK_INT<33 && handlesViewerBack) nativeBack(); else super.onBackPressed();}
-    public void copyInvite(String text) { runOnUiThread(() -> ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(L10n.t("P2PShare invitation"), text))); }
+    public void copyInvite(String text) {
+        runOnUiThread(() -> {
+            ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText(L10n.t("P2PShare invitation"), text));
+            }
+        });
+    }
+    private String readClipboard() {
+        try {
+            ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard == null) return "";
+            ClipData clip = clipboard.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return "";
+            ClipData.Item item = clip.getItemAt(0);
+            if (item == null) return "";
+            CharSequence text = item.coerceToText(this);
+            return text != null ? text.toString() : "";
+        } catch (RuntimeException error) {
+            DebugLog.record("clipboard_paste_error=" + error.getClass().getSimpleName());
+            return "";
+        }
+    }
     public String pasteInvite() {
-        ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-        ClipData clip = clipboard.getPrimaryClip();
-        return clip != null && clip.getItemCount() > 0 ? clip.getItemAt(0).coerceToText(this).toString() : "";
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return readClipboard();
+        }
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<String> result = new java.util.concurrent.atomic.AtomicReference<>("");
+        runOnUiThread(() -> {
+            try {
+                result.set(readClipboard());
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        return result.get();
+    }
+    public void editSignaling(String current) {
+        runOnUiThread(() -> {
+            android.widget.EditText url = new android.widget.EditText(this);
+            url.setInputType(
+                android.text.InputType.TYPE_CLASS_TEXT
+                    | android.text.InputType.TYPE_TEXT_VARIATION_URI
+                    | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            );
+            url.setSingleLine(true);
+            url.setHint("wss://...");
+            url.setText(current != null ? current : "");
+            url.setSelection(url.length());
+            url.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(2048)});
+            android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+                .setTitle(L10n.t("Signaling server"))
+                .setView(url)
+                .setPositiveButton(L10n.t("Save"), (d, which) -> nativeSignalingEdited(url.getText().toString()))
+                .setNegativeButton(L10n.t("Cancel"), null)
+                .create();
+            dialog.setOnShowListener(d -> {
+                url.requestFocus();
+                if (dialog.getWindow() != null) {
+                    dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+                }
+            });
+            dialog.show();
+        });
     }
     public void editName(String current) {
         runOnUiThread(() -> {
