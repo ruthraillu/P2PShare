@@ -564,7 +564,8 @@ pub fn run(app: winit::platform::android::activity::AndroidApp) {
     let _ = tracing::subscriber::set_global_default(subscriber);
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let bridge = Arc::new(Bridge::new(&app)?);
-        let _attachment = bridge.vm.attach_current_thread()?;
+        let attachment_bridge = bridge.clone();
+        let _attachment = attachment_bridge.vm.attach_current_thread()?;
         {
             let mut platform = platform_input().lock().unwrap();
             platform.back = false;
