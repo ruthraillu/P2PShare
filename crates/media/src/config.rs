@@ -196,6 +196,100 @@ impl StreamConfig {
     }
 }
 
+/// Process scheduling priority class for the P2PShare desktop process on Windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessPriority {
+    Normal,
+    #[default]
+    AboveNormal,
+}
+impl ProcessPriority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::AboveNormal => "above_normal",
+        }
+    }
+}
+
+/// Priority-ordered executables grouped under one logical Share Picker item.
+/// When a higher-priority executable spawns (e.g. game launching from its client),
+/// capture and app audio automatically promote to it and fall back when it closes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShareGroup {
+    pub name: String,
+    pub merge_in_picker: bool,
+    pub processes: Vec<String>,
+}
+impl Default for ShareGroup {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            merge_in_picker: true,
+            processes: Vec::new(),
+        }
+    }
+}
+
+pub fn default_share_groups() -> Vec<ShareGroup> {
+    vec![ShareGroup {
+        name: "League of Legends".into(),
+        merge_in_picker: true,
+        processes: vec![
+            "League of Legends.exe".into(),
+            "LeagueClientUx.exe".into(),
+        ],
+    }]
+}
+
+pub fn valid_process_exe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name.chars().count() <= 260
+        && name.to_ascii_lowercase().ends_with(".exe")
+        && name.len() > 4
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?'))
+}
+
+pub fn validate_share_groups(groups: &[ShareGroup]) -> Result<()> {
+    ensure!(
+        groups.len() <= 16,
+        "At most 16 share groups are supported"
+    );
+    for group in groups {
+        let trimmed = group.name.trim();
+        ensure!(
+            !trimmed.is_empty()
+                && trimmed == group.name
+                && trimmed.chars().count() <= 48
+                && !trimmed.chars().any(char::is_control),
+            "Share group names must be 1..48 printable characters"
+        );
+        ensure!(
+            !group.processes.is_empty() && group.processes.len() <= 16,
+            "Each share group must contain 1..16 executable filenames"
+        );
+        let mut seen = Vec::<String>::with_capacity(group.processes.len());
+        for exe in &group.processes {
+            ensure!(
+                valid_process_exe_name(exe),
+                "Share group processes must be executable filenames ending in .exe"
+            );
+            let lower = exe.to_ascii_lowercase();
+            ensure!(
+                !seen.contains(&lower),
+                "Duplicate executable filename within a share group"
+            );
+            seen.push(lower);
+        }
+    }
+    Ok(())
+}
+
 impl From<crate::VideoQuality> for StreamConfig {
     fn from(q: crate::VideoQuality) -> Self {
         Self {
@@ -449,5 +543,80 @@ mod thread_tests {
                 .unwrap()
                 .contains("software_threads")
         );
+    }
+}
+
+#[cfg(test)]
+mod share_group_and_priority_tests {
+    use super::*;
+
+    #[test]
+    fn process_priority_defaults_to_above_normal_and_roundtrips() {
+        assert_eq!(ProcessPriority::default(), ProcessPriority::AboveNormal);
+        assert_eq!(ProcessPriority::AboveNormal.as_str(), "above_normal");
+        assert_eq!(ProcessPriority::Normal.as_str(), "normal");
+        let parsed: ProcessPriority = serde_json::from_str(r#""normal""#).unwrap();
+        assert_eq!(parsed, ProcessPriority::Normal);
+    }
+
+    #[test]
+    fn default_share_groups_puts_league_game_before_client() {
+        let groups = default_share_groups();
+        validate_share_groups(&groups).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "League of Legends");
+        assert!(groups[0].merge_in_picker);
+        assert_eq!(
+            groups[0].processes,
+            ["League of Legends.exe", "LeagueClientUx.exe"]
+        );
+    }
+
+    #[test]
+    fn validate_share_groups_rejects_invalid_and_duplicate_entries() {
+        assert!(validate_share_groups(&[]).is_ok());
+        assert!(
+            validate_share_groups(&[ShareGroup {
+                name: "   ".into(),
+                merge_in_picker: true,
+                processes: vec!["game.exe".into()],
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_share_groups(&[ShareGroup {
+                name: "Empty".into(),
+                merge_in_picker: true,
+                processes: vec![],
+            }])
+            .is_err()
+        );
+        for bad in ["game", ".exe", "C:/game.exe", "a\\b.exe", "*.exe", " game.exe"] {
+            assert!(
+                validate_share_groups(&[ShareGroup {
+                    name: "Bad".into(),
+                    merge_in_picker: true,
+                    processes: vec![bad.into()],
+                }])
+                .is_err(),
+                "expected {bad:?} to fail"
+            );
+        }
+        assert!(
+            validate_share_groups(&[ShareGroup {
+                name: "Dup".into(),
+                merge_in_picker: true,
+                processes: vec!["Game.exe".into(), "game.EXE".into()],
+            }])
+            .is_err()
+        );
+        let too_many = (0..17)
+            .map(|i| ShareGroup {
+                name: format!("Group {i}"),
+                merge_in_picker: true,
+                processes: vec!["game.exe".into()],
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_share_groups(&too_many).is_err());
     }
 }

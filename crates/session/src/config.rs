@@ -1,6 +1,8 @@
 use super::cloudflare::{canonical_room, validate_server};
 use anyhow::{Context, Result, ensure};
-use p2pshare_media::config::StreamConfig;
+use p2pshare_media::config::{
+    ProcessPriority, ShareGroup, StreamConfig, default_share_groups, validate_share_groups,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -12,6 +14,7 @@ pub struct AppConfig {
     pub username: String,
     pub avatar:Option<String>,
     pub volume_step_percent: u8,
+    pub process_priority: ProcessPriority,
     pub profile_setup_complete: bool,
     pub theme: p2pshare_media::theme::Theme,
     pub signaling_url: String,
@@ -20,6 +23,7 @@ pub struct AppConfig {
     pub audio: p2pshare_media::audio::AudioConfig,
     pub audio_exclusions:p2pshare_media::audio::AudioExclusions,
     pub playback: p2pshare_media::playback::PlaybackConfig,
+    pub share_groups: Vec<ShareGroup>,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -29,6 +33,7 @@ impl Default for AppConfig {
             username: String::new(),
             avatar:None,
             volume_step_percent: 2,
+            process_priority: ProcessPriority::AboveNormal,
             profile_setup_complete: true,
             theme: Default::default(),
             signaling_url: String::new(),
@@ -37,6 +42,7 @@ impl Default for AppConfig {
             audio: Default::default(),
             audio_exclusions:Default::default(),
             playback: Default::default(),
+            share_groups: default_share_groups(),
         }
     }
 }
@@ -115,6 +121,7 @@ impl AppConfig {
         self.stream.validate()?;
         self.audio.validate()?;
         self.audio_exclusions.validate()?;
+        validate_share_groups(&self.share_groups)?;
         self.playback.validate()
     }
     pub fn set_signaling_url(&mut self, url: &str) -> Result<()> {
@@ -132,6 +139,8 @@ impl AppConfig {
                 if value.get("audio_exclusions").is_none()
                     || value.get("logging_enabled").is_none()
                     || value.get("volume_step_percent").is_none()
+                    || value.get("process_priority").is_none()
+                    || value.get("share_groups").is_none()
                     || value.get("theme").is_none()
                     || value.get("profile_setup_complete").is_none()
                     || value.get("room_password").is_some()
@@ -217,13 +226,19 @@ impl AppConfig {
             document.push('\n');
         }
         document.push_str(&format!(
-            "# Write diagnostics to P2PShare.log. Set false to disable logging; restart required.\nlogging_enabled = {}\n\n# Display name sent to other room members (1..32 characters).\nusername = {}\n\n# WebSocket signaling server. Both devices must use the same server for named rooms.\n# Use wss:// for public servers; ws:// is permitted only on loopback for tests.\nsignaling_url = {}\n\n# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.\n# Names are case-insensitive and repeated spaces are collapsed.\nroom_name = {}\n\n# Whether the first-start display-name prompt has been completed.\nprofile_setup_complete = {}\n\n# Playback volume change per mouse-wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n\n[stream]\n# Video codec: avc (default), hevc, or auto.\n# Auto prefers hardware HEVC, then hardware AVC, then software AVC.\n# Android is viewer-only and ignores the stream settings below.\ncodec = {}\n\n# Encoder backend: auto, nvenc (NVIDIA), amf (AMD), qsv (Intel), software.\nencoder = {}\n\n# Windows software encoding threads per stream: 1..8 or \"auto\" (codec chooses).\nsoftware_encode_threads = {}\n\n# Windows software decoding threads per watched stream: 1..8 or \"auto\".\n# Affects CPU decoding and hardware-decoder fallback; Android uses system codecs.\nsoftware_decode_threads = {}\n\n# Encoder bitrate in kilobits per second (100..50000).\nbitrate_kbps = {}\n\n# Target frame rate (1..120); actual throughput depends on capture and hardware.\nfps = {}\n\n# Maximum even output width (64..3840); aspect ratio is preserved.\nwidth = {}\n\n# Maximum even output height (64..3840); width * height must fit 3840 * 2160.\nheight = {}\n\n# Include the Windows mouse pointer in the shared video and previews.\n# Can also be changed live in the desktop stream settings.\nshow_cursor = {}\n\n# Include per-frame timing details in the log; increases log volume.\nlog_per_frame = {}\n\n# JPEG room preview refresh interval in seconds (10..60); maximum edge is 512 pixels.\npreview_interval_secs = {}\n\n[audio]\n# Capture selected app audio for window shares, or desktop sound for display shares.\nenabled = {}\n\n# Stereo Opus bitrate in kilobits per second (64..512), constant bitrate.\nbitrate_kbps = {}\n\n# Receive jitter buffer in milliseconds (10..100); lower values risk more underruns.\n# Used by Windows and Android playback; packets are 10 ms at 48 kHz stereo.\nplayback_buffer_ms = {}\n\n[playback]\n# Additional synchronized audio/video delay (0..1000 ms). Zero preserves immediate playback.\n# Applied by this viewer only; compressed packets are buffered with bounded memory.\nbuffer_ms = {}\n",
+            "# Write diagnostics to P2PShare.log. Set false to disable logging; restart required.\nlogging_enabled = {}\n\n# Display name sent to other room members (1..32 characters).\nusername = {}\n\n# WebSocket signaling server. Both devices must use the same server for named rooms.\n# Use wss:// for public servers; ws:// is permitted only on loopback for tests.\nsignaling_url = {}\n\n# Default room name: 3..64 ASCII letters, numbers, spaces, hyphens or underscores.\n# Names are case-insensitive and repeated spaces are collapsed.\nroom_name = {}\n\n# Whether the first-start display-name prompt has been completed.\nprofile_setup_complete = {}\n\n# Playback volume change per mouse-wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n\n# Windows process priority: \"above_normal\" (recommended, helps avoid audio pops) or \"normal\".\nprocess_priority = {}\n\n{}[stream]\n# Video codec: avc (default), hevc, or auto.\n# Auto prefers hardware HEVC, then hardware AVC, then software AVC.\n# Android is viewer-only and ignores the stream settings below.\ncodec = {}\n\n# Encoder backend: auto, nvenc (NVIDIA), amf (AMD), qsv (Intel), software.\nencoder = {}\n\n# Windows software encoding threads per stream: 1..8 or \"auto\" (codec chooses).\nsoftware_encode_threads = {}\n\n# Windows software decoding threads per watched stream: 1..8 or \"auto\".\n# Affects CPU decoding and hardware-decoder fallback; Android uses system codecs.\nsoftware_decode_threads = {}\n\n# Encoder bitrate in kilobits per second (100..50000).\nbitrate_kbps = {}\n\n# Target frame rate (1..120); actual throughput depends on capture and hardware.\nfps = {}\n\n# Maximum even output width (64..3840); aspect ratio is preserved.\nwidth = {}\n\n# Maximum even output height (64..3840); width * height must fit 3840 * 2160.\nheight = {}\n\n# Include the Windows mouse pointer in the shared video and previews.\n# Can also be changed live in the desktop stream settings.\nshow_cursor = {}\n\n# Include per-frame timing details in the log; increases log volume.\nlog_per_frame = {}\n\n# JPEG room preview refresh interval in seconds (10..60); maximum edge is 512 pixels.\npreview_interval_secs = {}\n\n[audio]\n# Capture selected app audio for window shares, or desktop sound for display shares.\nenabled = {}\n\n# Stereo Opus bitrate in kilobits per second (64..512), constant bitrate.\nbitrate_kbps = {}\n\n# Receive jitter buffer in milliseconds (10..100); lower values risk more underruns.\n# Used by Windows and Android playback; packets are 10 ms at 48 kHz stereo.\nplayback_buffer_ms = {}\n\n[playback]\n# Additional synchronized audio/video delay (0..1000 ms). Zero preserves immediate playback.\n# Applied by this viewer only; compressed packets are buffered with bounded memory.\nbuffer_ms = {}\n",
             self.logging_enabled,
             quote(&self.username),
             quote(&self.signaling_url),
             quote(&self.room_name),
             self.profile_setup_complete,
             self.volume_step_percent,
+            quote(self.process_priority.as_str()),
+            if self.share_groups.is_empty() {
+                "# Automatic window handoff groups (none configured).\nshare_groups = []\n\n"
+            } else {
+                ""
+            },
             codec,
             encoder,
             encode_threads,
@@ -241,6 +256,23 @@ impl AppConfig {
             self.playback.buffer_ms,
         ));
         document.push_str(&format!("\n[audio_exclusions]\n# Windows whole-display shares: capture allowed apps only, excluding the names below.\n# Also controlled by Exclude app audio in the screen-sharing settings.\nenabled = {}\n\n# Executable filenames, case-insensitive; matching apps and child processes are excluded.\n# Restart after editing this list. Window-specific audio is unaffected.\nprocesses = [{}]\n",self.audio_exclusions.enabled,self.audio_exclusions.processes.iter().map(|s|quote(s)).collect::<Vec<_>>().join(", ")));
+        if !self.share_groups.is_empty() {
+            document.push_str("\n# Automatic window handoff groups (highest priority executable first).\n# Controlled by Settings -> Share groups.\n");
+            for group in &self.share_groups {
+                let procs = group
+                    .processes
+                    .iter()
+                    .map(|p| quote(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                document.push_str(&format!(
+                    "[[share_groups]]\nname = {}\nmerge_in_picker = {}\nprocesses = [{}]\n\n",
+                    quote(&group.name),
+                    group.merge_in_picker,
+                    procs
+                ));
+            }
+        }
         document.push_str("\n[theme]\n");
         for (key, comment, value) in [
             ("background", "Workspace background", &self.theme.background),
@@ -533,4 +565,58 @@ mod avatar_config_test {
   c.audio_exclusions.enabled=true;c.audio_exclusions.processes=vec!["Discord.EXE".into(),"other app.exe".into()];let doc=c.document().unwrap();assert!(doc.contains("# Executable filenames"));let loaded=super::AppConfig::parse(&doc).unwrap();assert_eq!(loaded.audio_exclusions,c.audio_exclusions);
   assert!(super::AppConfig::parse("[audio_exclusions]\nprocesses=['C:/Discord.exe']").is_err());assert!(super::AppConfig::parse("[audio_exclusions]\nprocesses=['*.exe']").is_err());
  }
+}
+
+#[cfg(test)]
+mod share_group_and_priority_config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_upgrades_with_default_league_group_and_above_normal_priority() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.build/config-toml-tests")
+            .join(rand::random::<u64>().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(&path, "username = 'Alex'\n").unwrap();
+        let loaded = AppConfig::load_or_create(&path, "Windows").unwrap();
+        assert_eq!(loaded.process_priority, ProcessPriority::AboveNormal);
+        assert_eq!(loaded.share_groups.len(), 1);
+        assert_eq!(loaded.share_groups[0].name, "League of Legends");
+        assert_eq!(
+            loaded.share_groups[0].processes,
+            ["League of Legends.exe", "LeagueClientUx.exe"]
+        );
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("process_priority = \"above_normal\""));
+        assert!(rewritten.contains("[[share_groups]]"));
+    }
+
+    #[test]
+    fn empty_and_custom_share_groups_and_priority_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.process_priority = ProcessPriority::Normal;
+        cfg.share_groups.clear();
+        let empty_doc = cfg.document().unwrap();
+        assert!(empty_doc.contains("share_groups = []"));
+        let reparsed_empty = AppConfig::parse(&empty_doc).unwrap();
+        assert_eq!(reparsed_empty.process_priority, ProcessPriority::Normal);
+        assert!(reparsed_empty.share_groups.is_empty());
+
+        cfg.share_groups = vec![ShareGroup {
+            name: "Valorant".into(),
+            merge_in_picker: false,
+            processes: vec![
+                "VALORANT-Win64-Shipping.exe".into(),
+                "RiotClientUx.exe".into(),
+            ],
+        }];
+        let custom_doc = cfg.document().unwrap();
+        let reparsed = AppConfig::parse(&custom_doc).unwrap();
+        assert_eq!(reparsed.share_groups, cfg.share_groups);
+        assert!(
+            AppConfig::parse("[[share_groups]]\nname = 'Invalid'\nprocesses = ['not_an_exe']")
+                .is_err()
+        );
+    }
 }

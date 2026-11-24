@@ -3,6 +3,7 @@ pub(crate) enum Tab {
     #[default]
     Profile,
     Appearance,
+    ShareGroups,
     Diagnostics,
 }
 
@@ -112,7 +113,7 @@ mod tests {
         });
         for language in [Language::English, Language::PtBr] {
             let _language = scope(language);
-            for tab in [Tab::Profile, Tab::Appearance, Tab::Diagnostics] {
+            for tab in [Tab::Profile, Tab::Appearance, Tab::ShareGroups, Tab::Diagnostics] {
                 app.settings_tab = tab;
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(

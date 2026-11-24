@@ -9,6 +9,8 @@ pub struct Config {
     pub language:Option<p2pshare_media::i18n::Language>,
     pub username: String,
     pub volume_step_percent: u8,
+    pub process_priority: p2pshare_media::config::ProcessPriority,
+    pub share_groups: Vec<p2pshare_media::config::ShareGroup>,
     pub stream: Stream,
     pub playback: Playback,
     pub theme: Theme,
@@ -19,6 +21,8 @@ impl Default for Config {
             language:None,
             username: String::new(),
             volume_step_percent: 2,
+            process_priority: p2pshare_media::config::ProcessPriority::AboveNormal,
+            share_groups: p2pshare_media::config::default_share_groups(),
             stream: Default::default(),
             playback: Default::default(),
             theme: Default::default(),
@@ -189,6 +193,7 @@ impl Config {
         for s in self.theme.values() {
             color(s)?;
         }
+        p2pshare_media::config::validate_share_groups(&self.share_groups)?;
         Ok(())
     }
     pub fn load(path: &Path) -> Result<Self> {
@@ -222,8 +227,21 @@ impl Config {
         );
         text.insert_str(text.find("# JPEG room preview").unwrap(),&format!("# Apply configured desktop audio process exclusions.\nexclude_audio_processes = {}\n",self.stream.exclude_audio_processes));
         if let Some(language)=self.language{text.insert_str(0,&format!("# UI language: en or pt-BR.\nlanguage = {:?}\n\n",language.code()));}
+        let empty_groups = if self.share_groups.is_empty() {
+            "# Automatic window handoff groups (none configured).\nshare_groups = []\n\n"
+        } else {
+            ""
+        };
         let marker = text.find("[stream]").unwrap();
-        text.insert_str(marker,&format!("# Playback volume change per wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n\n",self.volume_step_percent));
+        text.insert_str(
+            marker,
+            &format!(
+                "# Playback volume change per wheel tick, in percentage points (1..100).\nvolume_step_percent = {}\n# Windows process priority: \"above_normal\" or \"normal\".\nprocess_priority = {}\n\n{}",
+                self.volume_step_percent,
+                serde_json::to_string(&self.process_priority)?,
+                empty_groups,
+            ),
+        );
         let comments = [
             "Main workspace background",
             "Room and member sidebar",
@@ -254,6 +272,14 @@ impl Config {
         ];
         for ((key, value), comment) in keys.into_iter().zip(self.theme.values()).zip(comments) {
             text += &format!("# {comment}; hex #RRGGBB.\n{key} = {value:?}\n");
+        }
+        for group in &self.share_groups {
+            text += &format!(
+                "\n[[share_groups]]\nname = {}\nmerge_in_picker = {}\nprocesses = {}\n",
+                serde_json::to_string(&group.name)?,
+                group.merge_in_picker,
+                serde_json::to_string(&group.processes)?,
+            );
         }
         // Replace only after a complete validated document is written.
         let temporary = path.with_extension("toml.pending");

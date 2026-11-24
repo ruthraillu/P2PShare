@@ -26,6 +26,8 @@ mod native;
 #[cfg(windows)]
 mod publisher;
 #[cfg(windows)]
+mod share_groups;
+#[cfg(windows)]
 mod test_source;
 #[cfg(windows)]
 mod wasapi;

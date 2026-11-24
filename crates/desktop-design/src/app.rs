@@ -56,6 +56,12 @@ pub struct Source {
     pub app: std::borrow::Cow<'static, str>,
     pub scene: usize,
     pub screen: bool,
+    pub grouped: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningApp {
+    pub exe: String,
+    pub title: String,
 }
 pub const SOURCES: [Source; 6] = [
     Source {
@@ -66,6 +72,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("Video player"),
         scene: 0,
         screen: false,
+        grouped: false,
     },
     Source {
         id: 0,
@@ -75,6 +82,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("Design studio"),
         scene: 1,
         screen: false,
+        grouped: false,
     },
     Source {
         id: 0,
@@ -84,6 +92,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("Code editor"),
         scene: 2,
         screen: false,
+        grouped: false,
     },
     Source {
         id: 0,
@@ -93,6 +102,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("Browser"),
         scene: 3,
         screen: false,
+        grouped: false,
     },
     Source {
         id: 0,
@@ -102,6 +112,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("1920 x 1080 · Primary"),
         scene: 1,
         screen: true,
+        grouped: false,
     },
     Source {
         id: 0,
@@ -111,6 +122,7 @@ pub const SOURCES: [Source; 6] = [
         app: std::borrow::Cow::Borrowed("1920 x 1080"),
         scene: 2,
         screen: true,
+        grouped: false,
     },
 ];
 #[derive(Clone)]
@@ -188,6 +200,11 @@ pub struct App {
     pub watching: std::collections::HashSet<u64>,
     pub stream_viewers:HashMap<u64,Vec<(u64,String)>>,
     pub local_preview_hidden: bool,
+    pub local_capture_hint: String,
+    pub running_apps: Vec<RunningApp>,
+    pub(crate) share_group_selected: usize,
+    pub(crate) share_group_exe_input: String,
+    pub(crate) share_group_focus_name: bool,
 }
 pub fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect::from_min_size(pos2(x, y), vec2(w.max(0.), h.max(0.)))
@@ -278,6 +295,11 @@ impl App {
             watching: Default::default(),
             stream_viewers:Default::default(),
             local_preview_hidden: false,
+            local_capture_hint: String::new(),
+            running_apps: Vec::new(),
+            share_group_selected: 0,
+            share_group_exe_input: String::new(),
+            share_group_focus_name: false,
         }
     }
     pub fn live(config: Config, room: String, prompt: bool) -> Self {
@@ -304,6 +326,17 @@ impl App {
                 }
         })
     }
+    /// Remote live streams need vsync-paced continuous polling; local preview can update as frames arrive.
+    pub fn has_visible_remote_live_video(&self) -> bool {
+        self.members.iter().enumerate().any(|(index, member)| {
+            index != 0
+                && member.scene.is_some()
+                && self.popped_out.is_none_or(|id| id == index)
+                && (self.popped_out.is_some() || !self.detached_peers.contains(&member.id))
+                && (!self.fullscreen || self.focus.unwrap_or(0) == index)
+                && (!self.live || self.watching.contains(&member.id))
+        })
+    }
     fn paint_stream(&self, ui: &Ui, area: Rect, member: usize) {
         if self.popped_out.is_none() && self.detached_peers.contains(&self.members[member].id) {
             ui.painter().text(
@@ -323,13 +356,35 @@ impl App {
             );
         } else {
             let source = &self.members[member];
-            self.paint_media(
-                ui,
-                area,
-                source.texture,
-                source.dimensions,
-                source.scene.unwrap_or_default(),
-            );
+            let has_hint = member == 0 && self.live && !self.local_capture_hint.is_empty();
+            if source.texture.is_some() || !has_hint {
+                self.paint_media(
+                    ui,
+                    area,
+                    source.texture,
+                    source.dimensions,
+                    source.scene.unwrap_or_default(),
+                );
+            }
+            if has_hint {
+                let p = self.palette();
+                let painter = ui.painter_at(area);
+                let hint = p2pshare_media::i18n::status(&self.local_capture_hint).into_owned();
+                let color = if source.texture.is_some() { p.text } else { p.muted };
+                let galley = painter.layout(
+                    hint,
+                    FontId::proportional(13.),
+                    color,
+                    (area.width() - 48.).max(80.),
+                );
+                let text_rect = Rect::from_center_size(area.center(), galley.size());
+                if source.texture.is_some() {
+                    let pill = text_rect.expand2(vec2(14., 10.)).intersect(area.shrink(8.));
+                    painter.rect_filled(pill, 8., Color32::from_black_alpha(190));
+                    painter.rect_stroke(pill, 8., Stroke::new(1., p.border), StrokeKind::Inside);
+                }
+                painter.galley(text_rect.min, galley, color);
+            }
         }
     }
     pub fn paint_media(
@@ -468,6 +523,9 @@ impl App {
         self.settings_tab = Default::default();
         self.draft = self.config.clone();
         self.name_input = self.config.username.clone();
+        self.share_group_selected = 0;
+        self.share_group_exe_input.clear();
+        self.share_group_focus_name = false;
         self.dialog = Dialog::Appearance;
         self.notice.clear();
     }
@@ -528,11 +586,36 @@ impl App {
             let foot = rect(main.left(), main.bottom() - 44., main.width(), 44.);
             self.regions.push(("footer".into(), foot));
             self.room_footer(ui, foot);
-            let content = Rect::from_min_max(
+            let mut content = Rect::from_min_max(
                 pos2(main.left() + 12., main.top() + 12.),
                 pos2(main.right() - 12., foot.top() - 12.),
             );
             if self.joined {
+                if self.live && self.dialog == Dialog::None && !self.notice.is_empty() {
+                    let bar = rect(content.left(), content.top(), content.width(), 34.);
+                    ui.painter().rect_filled(bar, 7., p.surface);
+                    ui.painter()
+                        .rect_stroke(bar, 7., Stroke::new(1., p.red), StrokeKind::Inside);
+                    let text_area = rect(
+                        bar.left() + 12.,
+                        bar.top(),
+                        (bar.width() - 46.).max(1.),
+                        bar.height(),
+                    );
+                    let message = p2pshare_media::i18n::status(&self.notice).into_owned();
+                    label(ui, text_area, &message, 12.5, p.red);
+                    self.regions.push(("room-notice".into(), bar));
+                    if self.button(
+                        ui,
+                        "dismiss-notice",
+                        rect(bar.right() - 30., bar.top() + 3., 26., 28.),
+                        "X",
+                        false,
+                    ) {
+                        self.notice.clear();
+                    }
+                    content = Rect::from_min_max(pos2(content.left(), bar.bottom() + 8.), content.max);
+                }
                 if let Some(id) = self.focus {
                     self.focus_view(ui, content, id);
                 } else {
@@ -1022,5 +1105,107 @@ mod join_status_tests {
                 matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == status)
             }));
         }
+    }
+
+    #[test]
+    fn room_notice_banner_renders_and_dismisses_in_joined_room() {
+        let ctx = egui::Context::default();
+        let mut app = App::live(Config::default(), "grupo".into(), false);
+        app.joined = true;
+        app.notice = "Could not apply settings: Capture failed".into();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect(0., 0., 1280., 832.)),
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        assert!(app.regions.iter().any(|(name, _)| name == "room-notice"));
+        let dismiss = app
+            .hits
+            .get("dismiss-notice")
+            .copied()
+            .expect("Dismiss notice button missing")
+            .center();
+        for pressed in [true, false] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect(0., 0., 1280., 832.)),
+                    events: vec![
+                        egui::Event::PointerMoved(dismiss),
+                        egui::Event::PointerButton {
+                            pos: dismiss,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| app.ui(ui),
+            );
+        }
+        assert!(app.notice.is_empty());
+    }
+
+    #[test]
+    fn local_capture_hint_renders_when_waiting_for_window() {
+        let ctx = egui::Context::default();
+        let mut app = App::live(Config::default(), "grupo".into(), false);
+        app.joined = true;
+        app.members[0].scene = Some(0);
+        app.members[0].texture = None;
+        app.local_capture_hint =
+            "Waiting for window — switch back to the shared window to start streaming.".into();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect(0., 0., 1280., 832.)),
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("Waiting for window"))
+        }));
+    }
+
+    #[test]
+    fn local_capture_hint_renders_overlay_over_live_texture() {
+        let ctx = egui::Context::default();
+        let mut app = App::live(Config::default(), "grupo".into(), false);
+        app.joined = true;
+        app.members[0].scene = Some(0);
+        app.members[0].texture = Some(egui::TextureId::User(1));
+        app.members[0].dimensions = [1920, 1080];
+        app.local_capture_hint =
+            "No video frames received from fullscreen game. Uncheck 'Disable fullscreen optimizations' on the game .exe or switch the game to Borderless.".into();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect(0., 0., 1280., 832.)),
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("Disable fullscreen optimizations"))
+        }));
+    }
+
+    #[test]
+    fn has_visible_remote_live_video_excludes_local_preview_only() {
+        let mut app = App::live(Config::default(), "grupo".into(), false);
+        app.joined = true;
+        app.members[0].scene = Some(0);
+        assert!(app.has_visible_live_video());
+        assert!(!app.has_visible_remote_live_video());
+        app.members.push(Member {
+            id: 42,
+            name: "Remote".into(),
+            scene: Some(0),
+            ..Default::default()
+        });
+        assert!(!app.has_visible_remote_live_video());
+        app.watching.insert(42);
+        assert!(app.has_visible_remote_live_video());
     }
 }

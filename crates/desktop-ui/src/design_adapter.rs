@@ -11,6 +11,8 @@ pub(super) fn ui_config(c: &AppConfig) -> Config {
         language:c.language,
         username: c.username.clone(),
         volume_step_percent: c.volume_step_percent,
+        process_priority: c.process_priority,
+        share_groups: c.share_groups.clone(),
         theme: c.theme.clone(),
         stream: Stream {
             codec: match c.stream.codec {
@@ -39,6 +41,11 @@ fn merged_config(current: &AppConfig, input: &Config) -> anyhow::Result<AppConfi
     c.username = input.username.trim().into();
     c.language = input.language;
     c.volume_step_percent = input.volume_step_percent;
+    c.process_priority = input.process_priority;
+    c.share_groups = input.share_groups.clone();
+    for group in &mut c.share_groups {
+        group.name = group.name.trim().into();
+    }
     c.profile_setup_complete = true;
     c.theme = input.theme.clone();
     c.stream.codec = match input.stream.codec.as_str() {
@@ -69,7 +76,11 @@ fn members(ui: &RoomUi, old: &[Member]) -> Vec<Member> {
         .map(|m| Member {
             id: m.id,
             name: m.name.clone(),
-            scene: if m.sharing { Some(0) } else { None },
+            scene: if m.sharing || (m.local && ui.capture_running) {
+                Some(0)
+            } else {
+                None
+            },
             texture: m.texture,
             // A retained decoded texture keeps its actual aspect ratio between
             // frames, even if an announcement reports a different rounded size.
@@ -117,8 +128,25 @@ pub(super) fn load_config(path: &std::path::Path) -> anyhow::Result<AppConfig> {
     }
     Ok(config)
 }
+fn format_capture_hint(
+    hint: &str,
+    source: Option<&p2pshare_media::CaptureSource>,
+    exe: Option<&str>,
+) -> String {
+    let base = p2pshare_media::i18n::status(hint);
+    let Some(source) = source else {
+        return base.into_owned();
+    };
+    let target = match exe.filter(|name| !name.is_empty()) {
+        Some(name) => format!("{} ({name})", source.title),
+        None => source.title.clone(),
+    };
+    format!("{base}\n{target}")
+}
+
 impl View {
     pub(super) fn sync_design(&mut self) {
+        let _language = p2pshare_media::i18n::scope(self.app_config.language.unwrap_or_default());
         self.sync_avatars();
         self.design.stream_viewers.clear();
         let roster=self.session.snapshot();
@@ -146,9 +174,41 @@ impl View {
         let old = std::mem::take(&mut self.design.members);
         self.design.members = members(&self.ui, &old);
         let state = self.session.snapshot();
+        let health = self.publisher.health();
+        let group_waiting = self
+            .active_group
+            .as_ref()
+            .filter(|g| g.missing_since.is_some())
+            .map(|g| g.group.name.clone());
+        self.design.local_capture_hint = if self.ui.capture_running {
+            if let Some(group_name) = &group_waiting {
+                format!(
+                    "{}\n{group_name}",
+                    p2pshare_media::tr!("Waiting for next window in group…")
+                )
+            } else {
+                health
+                    .capture_hint
+                    .as_deref()
+                    .map(|hint| {
+                        format_capture_hint(
+                            hint,
+                            self.active_source.as_ref(),
+                            self.active_source_exe.as_deref(),
+                        )
+                    })
+                    .unwrap_or_default()
+            }
+        } else {
+            String::new()
+        };
         for member in &mut self.design.members {
             if member.id != 0 && !self.design.watching.contains(&member.id) {
                 member.stats.clear();
+            } else if member.id == 0 && self.ui.capture_running && group_waiting.is_some() {
+                member.stats = p2pshare_media::tr!("Waiting for next window in group…").into();
+            } else if member.id == 0 && self.ui.capture_running && health.waiting_for_window {
+                member.stats = p2pshare_media::tr!("Waiting for window…").into();
             } else if let Some(peer) = state.members.iter().find(|p| {
                 (member.id == 0 && p.id == state.local_id)
                     || (member.id != 0 && p2pshare_room_ui::peer_ui_id(&p.id) == member.id)
@@ -203,7 +263,12 @@ impl View {
             }
         }
         for source in &mut self.design.sources {
-            source.texture = self.preview_textures.get(&source.id).map(|t| t.id());
+            let key = self
+                .picker_thumbnail_ids
+                .get(&source.id)
+                .copied()
+                .unwrap_or(source.id);
+            source.texture = self.preview_textures.get(&key).map(|t| t.id());
             source.dimensions = [360, 202];
         }
     }
@@ -218,7 +283,6 @@ impl View {
             c.audio != self.app_config.audio || c.audio_exclusions!=self.app_config.audio_exclusions || c.playback != self.app_config.playback;
         if stream_changed {
             self.publisher.configure(c.stream)?;
-            self.capture.set_cursor_capture(c.stream.show_cursor)?;
             if !crate::publisher::cursor_only_change(self.app_config.stream,c.stream){self.codecs.set_config(c.stream);}
             self.stream_config = c.stream;
             self.capture_meter =
@@ -237,6 +301,33 @@ impl View {
         }
         if c.username != self.app_config.username {
             self.session.command(Command::Rename(c.username.clone()));
+        }
+        if c.process_priority != self.app_config.process_priority {
+            match p2pshare_platform_windows::apply_process_priority(c.process_priority) {
+                Ok(()) => {
+                    tracing::info!(
+                        priority = c.process_priority.as_str(),
+                        "process_priority_updated"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "process_priority_apply_failed");
+                }
+            }
+        }
+        if let Some(active) = &mut self.active_group {
+            if let Some((idx, updated)) = c
+                .share_groups
+                .iter()
+                .enumerate()
+                .find(|(_, g)| g.name.eq_ignore_ascii_case(&active.group.name))
+            {
+                active.index = idx;
+                active.group = updated.clone();
+            } else {
+                self.active_group = None;
+                self.publisher.set_group_mode(false);
+            }
         }
         self.ui.name = c.username.clone();
         self.app_config = c;
@@ -396,9 +487,11 @@ impl View {
                     }
                     Intent::Start(id) => {
                         self.action(Action::StartCapture(id))?;
+                        self.design.notice.clear();
                     }
                     Intent::Stop => {
                         self.action(Action::StopCapture)?;
+                        self.design.notice.clear();
                     }
                 }
                 Ok(())
@@ -428,31 +521,52 @@ impl View {
             }
         }
         self.set_viewer_fullscreen(self.design.fullscreen);
+        let settings_open_now = matches!(self.design.dialog, Dialog::Appearance | Dialog::Crop);
+        if settings_open_now && !self.settings_open
+            && let Ok(sources) = enumerate_sources(Some(self.hwnd))
+        {
+            let windows = crate::share_groups::collect_window_entries(&sources);
+            self.design.running_apps = crate::share_groups::running_app_entries(&windows)
+                .into_iter()
+                .map(|(exe, title)| p2pshare_desktop_design::app::RunningApp { exe, title })
+                .collect();
+        }
+        self.settings_open = settings_open_now;
         let open = self.design.dialog == Dialog::Share;
+        let mut picker_thumbs = Vec::new();
         if open && !self.picker_open {
+            let _language =
+                p2pshare_media::i18n::scope(self.app_config.language.unwrap_or_default());
             self.preview_textures.clear();
+            self.picker_thumbnail_ids.clear();
             match enumerate_sources(Some(self.hwnd)) {
-                Ok(sources) => {
-                    self.ui.sources = sources;
+                Ok(raw_sources) => {
+                    let windows = crate::share_groups::collect_window_entries(&raw_sources);
+                    let (items, thumbs) = crate::share_groups::build_picker_items(
+                        &raw_sources,
+                        &windows,
+                        &self.app_config.share_groups,
+                    );
+                    self.ui.sources = items.iter().map(|i| i.source.clone()).collect();
                     self.design.selected = None;
-                    self.design.sources = self
-                        .ui
-                        .sources
-                        .iter()
-                        .map(|s| Source {
-                            id: s.id,
-                            title: s.title.clone().into(),
-                            app: match s.kind {
-                                p2pshare_media::SourceKind::Monitor => "Display",
-                                _ => "Application",
-                            }
-                            .into(),
+                    for item in &items {
+                        self.picker_thumbnail_ids
+                            .insert(item.source.id, item.thumbnail_id);
+                    }
+                    self.design.sources = items
+                        .into_iter()
+                        .map(|item| Source {
+                            id: item.source.id,
+                            title: item.source.title.into(),
+                            app: item.subtitle.into(),
                             scene: 0,
-                            screen: s.kind == p2pshare_media::SourceKind::Monitor,
+                            screen: item.source.kind == p2pshare_media::SourceKind::Monitor,
+                            grouped: item.grouped,
                             texture: None,
                             dimensions: [360, 202],
                         })
                         .collect();
+                    picker_thumbs = thumbs;
                 }
                 Err(e) => {
                     self.ui.status = format!("Could not list windows: {e}");
@@ -463,10 +577,11 @@ impl View {
             // One bounded snapshot batch per opening, shared by both tabs/search.
             // Filter changes only change which cached thumbnails are drawn.
             self.thumbnails
-                .set_sources(self.ui.sources.iter().take(96).cloned().collect());
+                .set_sources(picker_thumbs.into_iter().take(96).collect());
         } else if !open && self.picker_open {
             self.thumbnails.set_sources(Vec::new());
             self.preview_textures.clear();
+            self.picker_thumbnail_ids.clear();
         }
         self.picker_open = open;
     }
@@ -660,5 +775,14 @@ mod tests {
   let mut original=AppConfig::default();original.audio_exclusions.processes=vec!["custom.exe".into()];let mut ui=ui_config(&original);ui.stream.exclude_audio_processes=true;
   let changed=merged_config(&original,&ui).unwrap();assert!(changed.audio_exclusions.enabled);assert_eq!(changed.audio_exclusions.processes,original.audio_exclusions.processes);assert_eq!(changed.stream,original.stream);
   let parsed=AppConfig::parse(&changed.document().unwrap()).unwrap();assert!(ui_config(&parsed).stream.exclude_audio_processes);
+ }
+ #[test]fn source_subtitles_distinguish_game_and_minimized_lobby(){
+  let game=p2pshare_media::CaptureSource{id:1,kind:p2pshare_media::SourceKind::Window,title:"League of Legends (TM) Client".into(),size:Dimensions::new(1920,1080),process_id:Some(100)};
+  let lobby=p2pshare_media::CaptureSource{id:2,kind:p2pshare_media::SourceKind::Window,title:"League of Legends".into(),size:Dimensions::new(1600,900),process_id:Some(200)};
+  let monitor=p2pshare_media::CaptureSource{id:3,kind:p2pshare_media::SourceKind::Monitor,title:"Monitor".into(),size:Dimensions::new(1920,1080),process_id:None};
+  assert_eq!(crate::share_groups::source_subtitle(&game,Some("League of Legends.exe"),false),"League of Legends.exe · 1920×1080");
+  assert_eq!(crate::share_groups::source_subtitle(&lobby,Some("LeagueClientUx.exe"),true),"LeagueClientUx.exe · Minimized");
+  assert_eq!(crate::share_groups::source_subtitle(&monitor,None,false),"Display · 1920×1080");
+  assert_eq!(format_capture_hint("Waiting for window — switch back to the shared window to start streaming.",Some(&lobby),Some("LeagueClientUx.exe")),"Waiting for window — switch back to the shared window to start streaming.\nLeague of Legends (LeagueClientUx.exe)");
  }
 }

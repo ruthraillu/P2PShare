@@ -96,6 +96,39 @@ pub(crate) fn pin(ui: &Ui, area: Rect, color: Color32) {
         .line_segment([point(12., 16.), point(12., 22.)], stroke);
 }
 
+pub(crate) fn arrow_up(ui: &Ui, area: Rect, color: Color32) {
+    let scale = area.width().min(area.height()) / 16.;
+    let c = area.center();
+    let p = |dx: f32, dy: f32| c + egui::vec2(dx, dy) * scale;
+    let stroke = Stroke::new((1.6 * scale).max(1.2), color);
+    ui.painter().add(egui::epaint::PathShape::line(
+        vec![p(-4., 2.), p(0., -2.5), p(4., 2.)],
+        stroke,
+    ));
+}
+
+pub(crate) fn arrow_down(ui: &Ui, area: Rect, color: Color32) {
+    let scale = area.width().min(area.height()) / 16.;
+    let c = area.center();
+    let p = |dx: f32, dy: f32| c + egui::vec2(dx, dy) * scale;
+    let stroke = Stroke::new((1.6 * scale).max(1.2), color);
+    ui.painter().add(egui::epaint::PathShape::line(
+        vec![p(-4., -2.), p(0., 2.5), p(4., -2.)],
+        stroke,
+    ));
+}
+
+pub(crate) fn close_x(ui: &Ui, area: Rect, color: Color32) {
+    let scale = area.width().min(area.height()) / 16.;
+    let c = area.center();
+    let p = |dx: f32, dy: f32| c + egui::vec2(dx, dy) * scale;
+    let stroke = Stroke::new((1.6 * scale).max(1.2), color);
+    ui.painter()
+        .line_segment([p(-3.5, -3.5), p(3.5, 3.5)], stroke);
+    ui.painter()
+        .line_segment([p(3.5, -3.5), p(-3.5, 3.5)], stroke);
+}
+
 /// The same embedded artwork used by the executable and native Windows icon.
 pub(crate) fn app_icon(ui: &Ui, area: Rect) {
     let key = egui::Id::new("p2pshare-app-icon");

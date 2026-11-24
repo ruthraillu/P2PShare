@@ -9,8 +9,10 @@ mod detached_fit;
 #[path = "video_texture.rs"]
 mod video_texture;
 use p2pshare_codecs_windows::CodecWorker;
-use p2pshare_media::{CaptureState, Dimensions};
-use p2pshare_platform_windows::{GraphicsDevice, WindowsCapture, enumerate_sources};
+use p2pshare_media::Dimensions;
+use p2pshare_platform_windows::{
+    GraphicsDevice, apply_process_priority, enumerate_sources, process_executable_name,
+};
 use p2pshare_room_ui::{Action, RoomUi};
 use p2pshare_session::{Command, Session};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -107,7 +109,6 @@ impl Runner {
             view.poll_network();
             if let Err(error) = view.poll_capture() {
                 tracing::error!(%error, "Capture stopped");
-                let _ = view.capture.stop();
                 view.clear_capture();
                 view.ui.status = format!("Capture error: {error}");
             }
@@ -267,7 +268,7 @@ impl ApplicationHandler for Runner {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let popout_live = self.popouts.values().any(|child| {
-            !child.occluded && child.target.is_some() && child.app.has_visible_live_video()
+            !child.occluded && child.target.is_some() && child.app.has_visible_remote_live_video()
         });
         let main_visible = self
             .view
@@ -302,7 +303,7 @@ impl ApplicationHandler for Runner {
         if let Some(view) = &mut self.view {
             view.window_memory.flush(false);
             if (view.ui.in_room || view.ui.capture_running)
-                && ((view.smoke || view.capture_smoke || view.design.has_visible_live_video())
+                && ((view.smoke || view.capture_smoke || view.design.has_visible_remote_live_video())
                     && main_visible
                     || popout_live)
             {
@@ -313,10 +314,13 @@ impl ApplicationHandler for Runner {
                 return;
             }
             let interval = if view.ui.in_room || view.ui.capture_running {
-                if view.smoke || view.capture_smoke || view.design.has_visible_live_video() {
+                if view.smoke || view.capture_smoke || view.design.has_visible_remote_live_video() {
                     // Keep the old receive/decode polling cadence for live streams,
                     // including an occluded/minimized window.
                     Duration::from_micros(1_000_000 / view.stream_config.fps as u64)
+                } else if view.ui.capture_running && !view.design.local_preview_hidden {
+                    // Poll shared local preview frames without vsync-spinning when no remote stream is visible.
+                    Duration::from_millis(33)
                 } else {
                     // JPEG-only/hidden previews need room updates, not continuous redraws.
                     // Input events still request an immediate redraw.
@@ -332,7 +336,6 @@ impl ApplicationHandler for Runner {
                     view.poll_network();
                     if let Err(error) = view.poll_capture() {
                         tracing::error!(%error, "Capture stopped");
-                        let _ = view.capture.stop();
                         view.clear_capture();
                         view.ui.status = format!("Capture error: {error}");
                     }
@@ -348,6 +351,16 @@ impl ApplicationHandler for Runner {
         }
     }
 }
+struct ActiveGroup {
+    index: usize,
+    group: p2pshare_media::config::ShareGroup,
+    last_check: Instant,
+    missing_since: Option<Instant>,
+}
+
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const GROUP_MISSING_GRACE: Duration = Duration::from_secs(12);
+
 struct View {
     target: Option<ID3D11RenderTargetView>,
     dummy_target: Option<ID3D11RenderTargetView>,
@@ -364,7 +377,7 @@ struct View {
     graphics_retry:Option<Instant>,
     ctx: egui::Context,
     input: egui_winit::State,
-    capture: crate::local_preview::LocalPreview<WindowsCapture>,
+    shared_preview: crate::local_preview::SharedPreviewReceiver,
     ui: RoomUi,
     design: p2pshare_desktop_design::app::App,
     app_config: p2pshare_session::AppConfig,
@@ -374,8 +387,12 @@ struct View {
     config_path: std::path::PathBuf,
     thumbnails: crate::thumbnails::Thumbnails,
     preview_textures: HashMap<u64, egui::TextureHandle>,
+    picker_thumbnail_ids: HashMap<u64, u64>,
     picker_open: bool,
+    settings_open: bool,
+    active_group: Option<ActiveGroup>,
     active_source: Option<p2pshare_media::CaptureSource>,
+    active_source_exe: Option<String>,
     session: Arc<Session>,
     codecs: CodecWorker,
     publisher: crate::publisher::Publisher,
@@ -400,7 +417,7 @@ struct View {
     test_receiver: Option<Session>,
     test_joined: bool,
     test_decoded: bool,
-    registered: Option<(ID3D11Texture2D, egui::TextureId)>,
+    local_preview_dirty: bool,
     next_redraw: Instant,
     force_present: bool,
     redraw_requested: bool,
@@ -473,8 +490,7 @@ impl View {
             None,
             Some(16384),
         );
-        let capture =
-            crate::local_preview::LocalPreview::new(WindowsCapture::new(graphics.clone()));
+        let shared_preview = crate::local_preview::SharedPreviewReceiver::default();
         let smoke = std::env::args().any(|a| a == "--ui-smoke");
         let capture_smoke = std::env::args().any(|a| a == "--capture-ui-smoke");
         let test_source = if capture_smoke {
@@ -489,6 +505,19 @@ impl View {
         }
         let config_path = p2pshare_media::portable::config_path()?;
         let app_config = design_adapter::load_config(&config_path)?;
+        if !smoke && !capture_smoke {
+            match apply_process_priority(app_config.process_priority) {
+                Ok(()) => tracing::info!(
+                    priority = app_config.process_priority.as_str(),
+                    "process_priority_applied"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    priority = app_config.process_priority.as_str(),
+                    "process_priority_apply_failed"
+                ),
+            }
+        }
         let mut design = p2pshare_desktop_design::app::App::live(
             design_adapter::ui_config(&app_config),
             app_config.room_name.clone(),
@@ -574,7 +603,7 @@ impl View {
             graphics_retry:None,
             ctx,
             input,
-            capture,
+            shared_preview,
             ui,
             design,
             app_config,
@@ -587,8 +616,12 @@ impl View {
             config_path,
             thumbnails,
             preview_textures: HashMap::new(),
+            picker_thumbnail_ids: HashMap::new(),
             picker_open: false,
+            settings_open: false,
+            active_group: None,
             active_source: None,
+            active_source_exe: None,
             session,
             codecs,
             publisher,
@@ -615,7 +648,7 @@ impl View {
             flushed_preview_epoch: 0,
             last_members: vec![],
             published_size: p2pshare_media::Dimensions::default(),
-            registered: None,
+            local_preview_dirty: false,
             next_redraw: Instant::now(),
             force_present: true,
             redraw_requested: false,
@@ -640,8 +673,8 @@ impl View {
                 .iter()
                 .find(|s| s.title == "P2PShare egui test source")
             {
-                view.capture.start(source)?;
                 view.publisher.start(source.clone())?;
+                view.publisher.set_preview_enabled(true);
                 view.ui.capture_running = true;
             } else {
                 return Err("Synthetic capture source not enumerated".into());
@@ -679,7 +712,6 @@ impl View {
         self.window_memory
             .capture(self.hwnd, self.window.fullscreen().is_some());
         self.window_memory.flush(true);
-        let _ = self.capture.stop();
         event_loop.exit();
     }
     fn create_target(&mut self) -> Result<()> {
@@ -756,75 +788,154 @@ impl View {
         Ok(())
     }
     fn clear_capture(&mut self) {
+        self.active_group = None;
+        self.publisher.set_group_mode(false);
         self.active_source = None;
-        let _ = self.capture.stop();
+        self.active_source_exe = None;
+        self.publisher.set_preview_enabled(false);
         if let Some(audio) = &self.audio {
             audio.set_source(None);
         }
-        if let Some((_, id)) = self.registered.take() {
-            self.renderer.unregister_user_texture(id);
-        }
+        self.shared_preview.clear(&mut self.renderer);
+        self.local_preview_dirty = false;
         self.ui.clear_local_frame();
         self.session.command(Command::Unpublish);
         self.codecs.clear_pending();
         self.publisher.stop();
         self.published_size = p2pshare_media::Dimensions::default();
     }
+    fn start_window_or_monitor_source(
+        &mut self,
+        source: p2pshare_media::CaptureSource,
+        exe: Option<String>,
+    ) -> Result<()> {
+        // Publisher owns the single WGC session for capture, encode and preview.
+        self.publisher.start(source.clone()).map_err(|error| {
+            windows::core::Error::new(
+                windows::core::HRESULT(0x80004005u32 as i32),
+                error.to_string(),
+            )
+        })?;
+        self.shared_preview.clear(&mut self.renderer);
+        self.local_preview_dirty = false;
+        let want_preview = self.capture_smoke || !self.design.local_preview_hidden;
+        self.publisher.set_preview_enabled(want_preview);
+        self.active_source_exe = exe.or_else(|| source.process_id.and_then(process_executable_name));
+        self.active_source = Some(source.clone());
+        if let Some(audio) = &self.audio {
+            audio.set_source(Some(&source));
+        }
+        self.ui.capture_running = true;
+        self.ui.status = format!("Starting {}…", source.title);
+        Ok(())
+    }
+    fn poll_active_group(&mut self, source_closed: bool) {
+        let Some(active) = self.active_group.as_mut() else {
+            return;
+        };
+        let just_closed = source_closed && self.active_source.is_some();
+        if just_closed {
+            self.active_source = None;
+            self.active_source_exe = None;
+            self.shared_preview.clear(&mut self.renderer);
+            self.ui.clear_local_frame();
+            if let Some(audio) = &self.audio {
+                audio.set_source(None);
+            }
+        }
+        let poll_interval = if active.missing_since.is_some() {
+            Duration::from_millis(400)
+        } else {
+            GROUP_POLL_INTERVAL
+        };
+        if !just_closed && active.last_check.elapsed() < poll_interval {
+            return;
+        }
+        active.last_check = Instant::now();
+        let Ok(raw_sources) = enumerate_sources(Some(self.hwnd)) else {
+            return;
+        };
+        let windows = crate::share_groups::collect_window_entries(&raw_sources);
+        let current_id = self.active_source.as_ref().map(|s| s.id);
+        let current_alive = !source_closed
+            && current_id.is_some_and(|id| windows.iter().any(|w| w.source.id == id));
+        let group = active.group.clone();
+        if let Some(best) = crate::share_groups::pick_best_window(&group, &windows) {
+            active.missing_since = None;
+            if crate::share_groups::should_switch_group_window(
+                &group,
+                current_id,
+                self.active_source_exe.as_deref(),
+                current_alive,
+                best,
+            ) {
+                match self.start_window_or_monitor_source(best.source.clone(), best.exe.clone()) {
+                    Ok(()) => {
+                        tracing::info!(
+                            group = %group.name,
+                            title = %best.source.title,
+                            exe = best.exe.as_deref().unwrap_or(""),
+                            "share_group_switched"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, group = %group.name, "share_group_switch_failed");
+                    }
+                }
+            }
+            return;
+        }
+        if source_closed || self.active_source.is_none() || !current_alive {
+            if self.active_source.is_some() {
+                self.active_source = None;
+                self.active_source_exe = None;
+                self.shared_preview.clear(&mut self.renderer);
+                self.ui.clear_local_frame();
+                if let Some(audio) = &self.audio {
+                    audio.set_source(None);
+                }
+            }
+            let since = *self
+                .active_group
+                .as_mut()
+                .unwrap()
+                .missing_since
+                .get_or_insert_with(Instant::now);
+            if since.elapsed() >= GROUP_MISSING_GRACE {
+                tracing::info!(group = %group.name, "share_group_ended_after_grace");
+                self.clear_capture();
+                self.ui.status = "The shared window closed. Choose another screen.".into();
+            }
+        }
+    }
     fn poll_capture(&mut self) -> Result<()> {
         if !self.ui.capture_running {
+            self.publisher.set_preview_enabled(false);
             return Ok(());
         }
-        if let Err(error) = self.capture.set_visible(!self.design.local_preview_hidden) {
-            tracing::warn!(%error, "local_preview_restart_failed");
-            self.ui.status = "Local preview unavailable; screen sharing continues".into();
-            return Ok(());
-        }
-        if self.design.local_preview_hidden {
-            // Release the capture session and GPU texture, while keeping sharing,
-            // its dimensions, audio and remote viewers intact.
-            if let Some((_, id)) = self.registered.take() {
-                self.renderer.unregister_user_texture(id);
-                if let Some(member) = self.ui.participants.iter_mut().find(|p| p.local) {
-                    member.texture = None;
-                }
+        let want_preview = self.capture_smoke
+            || (!self.design.local_preview_hidden
+                && ((!self.occluded
+                    && self.target.is_some()
+                    && !self.design.detached_peers.contains(&0))
+                    || self.design.detached_peers.contains(&0)));
+        self.publisher.set_preview_enabled(want_preview);
+        if !want_preview {
+            self.shared_preview.clear(&mut self.renderer);
+            if let Some(member) = self.ui.participants.iter_mut().find(|p| p.local) {
+                member.texture = None;
             }
             return Ok(());
         }
-        match self.capture.state() {
-            CaptureState::Paused => {
-                self.ui.status = "Shared window minimized • preview paused".into();
-                return Ok(());
-            }
-            CaptureState::Stopped | CaptureState::SourceClosed => return Ok(()),
-            CaptureState::Capturing => {}
-        }
-        if let Some(frame) = self.capture.poll_frame()? {
+        if let Some((id, size)) = self.shared_preview.poll(
+            &self.graphics,
+            &mut self.renderer,
+            &self.publisher.preview(),
+        ) {
             self.capture_meter.frame(0);
-            if self
-                .registered
-                .as_ref()
-                .is_none_or(|(texture, _)| *texture != frame.texture)
-            {
-                if let Some((_, id)) = self.registered.take() {
-                    self.renderer.unregister_user_texture(id);
-                }
-                let mut srv = None;
-                // SAFETY: capture texture is shader-readable and owned until the next capture poll.
-                unsafe {
-                    self.graphics.device.CreateShaderResourceView(
-                        &frame.texture,
-                        None,
-                        Some(&mut srv),
-                    )?;
-                }
-                let id = self
-                    .renderer
-                    .register_user_texture(srv.ok_or_else(windows::core::Error::empty)?);
-                self.registered = Some((frame.texture.clone(), id));
-            }
-            if let Some((_, id)) = &self.registered {
-                self.ui.set_local_frame(*id, frame.metadata.size);
-            }
+            self.ui.set_local_frame(id, size);
+            self.preview_epoch = self.preview_epoch.wrapping_add(1);
+            self.local_preview_dirty = true;
         }
         Ok(())
     }
@@ -902,34 +1013,61 @@ impl View {
                 self.ui.sources = enumerate_sources(Some(self.hwnd))?;
             }
             Action::StartCapture(id) => {
-                if self.ui.capture_running
-                    && self.active_source.as_ref().is_some_and(|s| s.id == id)
-                {
-                    let health = self.publisher.health();
-                    if !health.source_closed && health.error.is_none() {
-                        return Ok(());
+                if self.ui.capture_running {
+                    let already_running = if let Some(gi) =
+                        crate::share_groups::group_index_from_id(id)
+                    {
+                        self.active_group.as_ref().is_some_and(|g| g.index == gi)
+                    } else {
+                        self.active_group.is_none()
+                            && self.active_source.as_ref().is_some_and(|s| s.id == id)
+                    };
+                    if already_running {
+                        let health = self.publisher.health();
+                        if !health.source_closed && health.error.is_none() {
+                            return Ok(());
+                        }
                     }
                 }
-                if let Some(source) = self.ui.sources.iter().find(|s| s.id == id).cloned() {
-                    // Publisher validates the replacement before releasing the old capture.
-                    // Keep the room publication and viewers intact throughout the handoff.
-                    self.publisher.start(source.clone()).map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()))?;
-                    self.capture.stop()?;
-                    if let Some((_,id))=self.registered.take(){self.renderer.unregister_user_texture(id);}
-                    self.capture.set_cursor_capture(self.stream_config.show_cursor)?;
-                    self.capture.set_visible(!self.design.local_preview_hidden)?;
-                    if let Err(error)=self.capture.start(&source){tracing::warn!(%error,"source_switch_local_preview_failed");}
-                    self.active_source = Some(source.clone());
-                    if let Some(audio) = &self.audio {
-                        audio.set_source(Some(&source));
+                if let Some(gi) = crate::share_groups::group_index_from_id(id)
+                    && let Some(group) = self.app_config.share_groups.get(gi).cloned()
+                {
+                    let raw_sources = enumerate_sources(Some(self.hwnd))?;
+                    let windows = crate::share_groups::collect_window_entries(&raw_sources);
+                    let best = crate::share_groups::pick_best_window(&group, &windows)
+                        .ok_or_else(|| {
+                            windows::core::Error::new(
+                                windows::core::HRESULT(0x80070057u32 as i32),
+                                "No matching window for this group is open",
+                            )
+                        })?;
+                    self.publisher.set_group_mode(true);
+                    let res =
+                        self.start_window_or_monitor_source(best.source.clone(), best.exe.clone());
+                    if let Err(error) = res {
+                        self.active_group = None;
+                        self.publisher.set_group_mode(false);
+                        return Err(error);
                     }
-                    self.ui.capture_running = true;
-                    self.ui.status = format!("Starting {}…", source.title);
+                    self.active_group = Some(ActiveGroup {
+                        index: gi,
+                        group: group.clone(),
+                        last_check: Instant::now(),
+                        missing_since: None,
+                    });
+                    tracing::info!(
+                        group = %group.name,
+                        title = %best.source.title,
+                        exe = best.exe.as_deref().unwrap_or(""),
+                        "share_group_started"
+                    );
+                } else if let Some(source) = self.ui.sources.iter().find(|s| s.id == id).cloned() {
+                    self.active_group = None;
+                    self.publisher.set_group_mode(false);
+                    self.start_window_or_monitor_source(source, None)?;
                 }
             }
             Action::StopCapture => {
-                self.active_source = None;
-                self.capture.stop()?;
                 self.clear_capture();
                 self.ui.status = "Screen sharing stopped".into();
             }
@@ -967,7 +1105,6 @@ impl View {
             let _ = std::fs::write(path, invite);
         }
         if !state.busy && !state.in_room && self.ui.capture_running {
-            let _ = self.capture.stop();
             self.clear_capture();
         }
         self.ui.apply_snapshot(&room_state(&state));
@@ -1006,15 +1143,19 @@ impl View {
         let health = self.publisher.health();
         self.ui.encoder = health.backend;
         self.ui.capture_fps = health.fps;
-        if health.source_closed && self.ui.capture_running {
-            self.clear_capture();
-            self.ui.status = "The shared window closed. Choose another screen.".into();
+        if self.ui.capture_running {
+            if self.active_group.is_some() {
+                self.poll_active_group(health.source_closed);
+            } else if health.source_closed {
+                self.clear_capture();
+                self.ui.status = "The shared window closed. Choose another screen.".into();
+            }
         }
         if let Some(error) = self.publisher.take_error() {
             if self.ui.capture_running {
-                let _ = self.capture.stop();
                 self.clear_capture();
             }
+            self.design.notice = error.clone();
             self.ui.status = error;
         }
         let members: Vec<_> = state
@@ -1130,9 +1271,10 @@ impl View {
         if self.telemetry_at.elapsed() >= Duration::from_secs(1) {
             let health = self.publisher.health();
             let state = self.session.snapshot();
+            let preview_active = self.publisher.preview().is_enabled();
             tracing::info!(capture_running=self.ui.capture_running, viewers=state.viewer_count,
                 local_preview_hidden=self.design.local_preview_hidden,
-                local_preview_capture_active=self.capture.state()!=CaptureState::Stopped,
+                local_preview_capture_active=preview_active,
                 video_mode=if !self.ui.capture_running {"not_sharing"} else if self.session.needs_live_video() {"streaming"} else {"previews_only_no_viewers"},
                 backend=%health.backend,published_frames=health.published_frames,
                 metrics=%self.session.video_diagnostics(),codec_queues=%health.queues, readback=%health.readback, "stream_health");
@@ -1151,16 +1293,16 @@ impl View {
             self.cpu_profile.sample(
                 self.ui.capture_running,
                 watching,
-                self.capture.state() != CaptureState::Stopped,
+                preview_active,
                 self.design.local_preview_hidden,
             );
             self.telemetry_at = Instant::now();
         }
         if let Err(error) = self.poll_capture() {
             tracing::error!(%error, "Capture stopped");
-            let _ = self.capture.stop();
             self.clear_capture();
             self.ui.status = format!("Capture error: {error}");
+            self.design.notice = self.ui.status.clone();
         }
         if self.target.is_none() || self.occluded {
             self.sync_design();
@@ -1205,7 +1347,8 @@ impl View {
         // to the driver/compositor. Live video preserves the existing vsync path.
         let paint = legacy
             || self.force_present
-            || self.design.has_visible_live_video()
+            || self.local_preview_dirty
+            || self.design.has_visible_remote_live_video()
             || self.renderer.needs_render(target, &self.ctx, &output)?;
         if paint {
             unsafe {
@@ -1351,14 +1494,14 @@ impl View {
                             "Viewer Back/landscape transition failed",
                         ));
                     }
-                    if self.registered.is_none() {
+                    if !self.shared_preview.has_frame() {
                         return Err(windows::core::Error::new(
                             windows::core::HRESULT(0x80004005u32 as i32),
                             "Capture UI received no frames",
                         ));
                     }
                     self.action(Action::StopCapture)?;
-                    if self.registered.is_some() || self.ui.capture_running {
+                    if self.shared_preview.has_frame() || self.ui.capture_running {
                         return Err(windows::core::Error::new(
                             windows::core::HRESULT(0x80004005u32 as i32),
                             "Capture UI did not release stopped texture",
@@ -1377,13 +1520,13 @@ impl View {
                     self.action(Action::StartCapture(source))?;
                 }
                 _ => {
-                    if self.capture_smoke && (!self.test_decoded || self.registered.is_none()) {
+                    if self.capture_smoke && (!self.test_decoded || !self.shared_preview.has_frame()) {
                         return Err(windows::core::Error::new(
                             windows::core::HRESULT(0x80004005u32 as i32),
                             "Capture UI restart or encrypted H.264 remote decode failed",
                         ));
                     }
-                    self.capture.stop()?;
+                    self.publisher.stop();
                     event_loop.exit();
                 }
             }
@@ -1405,6 +1548,7 @@ impl View {
             self.presented_frames += 1;
             self.presented_last_frame = true;
             self.force_present = false;
+            self.local_preview_dirty = false;
             self.preview_meter.frame(0);
         }
         self.preview_meter.report();
@@ -1461,7 +1605,8 @@ impl View {
 }
 impl Drop for View {
     fn drop(&mut self) {
-        let _ = self.capture.stop();
+        self.publisher.set_preview_enabled(false);
+        self.shared_preview.clear(&mut self.renderer);
     }
 }
 

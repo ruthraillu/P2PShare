@@ -127,6 +127,9 @@ fn worker(
         let mut capture = WindowsCapture::new(graphics.clone());
         let result = (|| -> anyhow::Result<Option<egui::ColorImage>> {
             capture.start(&source)?;
+            if capture.state() == p2pshare_media::CaptureState::Paused {
+                return Ok(None);
+            }
             let deadline = Instant::now() + Duration::from_millis(350);
             while Instant::now() < deadline && generation.load(Ordering::Acquire) == g {
                 if let Some(frame) = capture.poll_frame()? {
