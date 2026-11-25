@@ -1,0 +1,13 @@
+{
+  "name": "p2pshare-signaling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.0",
+    "miniflare": "4.20260730.0"
+  }
+}

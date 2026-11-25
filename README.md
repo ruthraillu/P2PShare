@@ -20,3 +20,8 @@ For a fresh Windows install, extract P2PShare-Windows-x64.zip. If you are on v0.
 Commits, pull requests, and manually started workflow runs build artifacts. To publish, bump the workspace version in Cargo.toml, update Cargo.lock, and push a new matching tag. The publishing job uploads the Windows ZIP, its detached signature, and the Android APK. It uses the P2PSHARE_WINDOWS_SIGNING_KEY and P2PSHARE_ANDROID_SIGNING_KEY Actions secrets.
 
 The packager verifies and reuses the codec DLLs from the ZIP pinned in [codec-seed.json](vendor/ffmpeg-runtime/codec-seed.json) and includes the codec license files and a link to the corresponding FFmpeg source. Files under assets/windows-update/ are packaged into data/assets/ and recorded in the managed file inventory.
+
+## Signaling Worker
+
+[server/signaling-worker](server/signaling-worker/README.md) contains the Cloudflare Worker (Durable Objects) used for room presence and WebRTC signaling. See its [README](server/signaling-worker/README.md) for local tests (`worker.ps1 -Action Test`) and self-hosted Cloudflare deployment instructions (`worker.ps1 -Action Deploy`).
+
