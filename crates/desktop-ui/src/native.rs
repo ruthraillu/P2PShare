@@ -24,12 +24,17 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{COLORREF, HWND},
         Graphics::{
             Direct3D11::*,
             Dxgi::{Common::*, *},
         },
         System::WinRT::*,
+        UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW,
+            SetWindowPos, WS_EX_LAYERED,
+        },
     },
     core::{Interface, Result},
 };
@@ -89,8 +94,67 @@ fn input_requests_redraw(event: &WindowEvent, repaint: bool) -> bool {
 // Only transient presentation/access errors are retried. Device removal and
 // programming errors still go through the normal fatal diagnostic path.
 fn transient_display_error(code:i32)->bool{matches!(code as u32,0x887A000A|0x887A0022|0x887A0026|0x887A0028)}
+
+/// Keep fullscreen borderless windows in DWM Composed Flip instead of DirectFlip/MPO.
+/// Several Windows 11 + GPU driver combinations stall DirectFlip updates to ~1 FPS when idle
+/// until cursor movement wakes composition, whereas DWM Composed Flip stays at display refresh.
+pub(super) fn set_fullscreen_composed(hwnd: HWND, enabled: bool) {
+    // SAFETY: `hwnd` is a live top-level Win32 window on the UI thread; toggling `WS_EX_LAYERED`
+    // with `LWA_ALPHA = 255` preserves opaque appearance while keeping DWM composition active.
+    unsafe {
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered = WS_EX_LAYERED.0 as isize;
+        if enabled {
+            if (current & layered) == 0 {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | layered);
+            }
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        } else if (current & layered) != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current & !layered);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
 #[cfg(test)]mod display_transition_tests{
  #[test]fn retry_only_recoverable_display_errors(){for code in [0x887A000Au32,0x887A0022,0x887A0026,0x887A0028]{assert!(super::transient_display_error(code as i32));}for code in [0,0x887A0005u32,0x887A0006,0x80070057]{assert!(!super::transient_display_error(code as i32));}}
+ #[test]fn fullscreen_composed_toggles_opaque_layered_style_with_flip_swap_chain(){
+  use super::*;
+  use windows::{Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,Win32::UI::WindowsAndMessaging::{CreateWindowExW,DestroyWindow,GetLayeredWindowAttributes,LAYERED_WINDOW_ATTRIBUTES_FLAGS,WINDOW_EX_STYLE,WS_POPUP},core::w};
+  unsafe{
+   let hwnd=CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),w!("Fullscreen composed test"),WS_POPUP,0,0,64,64,None,None,None,None).unwrap();
+   let result=(||->Result<()>{
+    let mut device=None;
+    D3D11CreateDevice(None,D3D_DRIVER_TYPE_WARP,windows::Win32::Foundation::HMODULE::default(),D3D11_CREATE_DEVICE_BGRA_SUPPORT,None,D3D11_SDK_VERSION,Some(&mut device),None,None)?;
+    let device=device.unwrap();
+    let dxgi:IDXGIDevice=device.cast()?;
+    let factory:IDXGIFactory2=dxgi.GetAdapter()?.GetParent()?;
+    let desc=DXGI_SWAP_CHAIN_DESC1{Width:64,Height:64,Format:DXGI_FORMAT_B8G8R8A8_UNORM,SampleDesc:DXGI_SAMPLE_DESC{Count:1,Quality:0},BufferUsage:DXGI_USAGE_RENDER_TARGET_OUTPUT,BufferCount:3,SwapEffect:DXGI_SWAP_EFFECT_FLIP_DISCARD,Scaling:DXGI_SCALING_STRETCH,AlphaMode:DXGI_ALPHA_MODE_IGNORE,..Default::default()};
+    let swap=factory.CreateSwapChainForHwnd(&device,hwnd,&desc,None,None)?;
+    let layered=WS_EX_LAYERED.0 as isize;
+    assert_eq!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&layered,0);
+    set_fullscreen_composed(hwnd,true);
+    assert_eq!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&layered,layered);
+    let mut alpha=0u8;let mut flags=LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+    GetLayeredWindowAttributes(hwnd,None,Some(&mut alpha),Some(&mut flags))?;
+    assert_eq!(alpha,255);assert_eq!(flags,LWA_ALPHA);
+    swap.Present(0,DXGI_PRESENT(0)).ok()?;
+    set_fullscreen_composed(hwnd,false);
+    assert_eq!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&layered,0);
+    Ok(())
+   })();
+   DestroyWindow(hwnd).unwrap();
+   result.unwrap();
+  }
+ }
 }
 struct Runner {
     view: Option<View>,
@@ -469,7 +533,7 @@ impl View {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
+                BufferCount: 3,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 Scaling: DXGI_SCALING_STRETCH,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -699,13 +763,16 @@ impl View {
             }
             self.window
                 .set_fullscreen(Some(winit::window::Fullscreen::Borderless(monitor)));
+            set_fullscreen_composed(self.hwnd, true);
         } else {
             self.window.set_fullscreen(None);
             if self.maximized_before_fullscreen {
                 self.window.set_maximized(true);
             }
             self.maximized_before_fullscreen = false;
+            set_fullscreen_composed(self.hwnd, false);
         }
+        self.force_present = true;
         self.request_redraw();
     }
     fn close(&mut self, event_loop: &ActiveEventLoop) {

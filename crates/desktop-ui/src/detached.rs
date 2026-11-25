@@ -10,6 +10,7 @@ pub(super) struct Detached {
     swap: IDXGISwapChain1,
     renderer: egui_directx11::Renderer,
     fit: super::detached_fit::Guard,
+    hwnd: HWND,
     pub window: Window,
     pub app: App,
     pub occluded: bool,
@@ -75,7 +76,7 @@ impl Detached {
                         Quality: 0,
                     },
                     BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                    BufferCount: 2,
+                    BufferCount: 3,
                     SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                     ..Default::default()
                 },
@@ -103,6 +104,7 @@ impl Detached {
             swap,
             renderer,
             fit,
+            hwnd,
             window,
             app,
             occluded: false,
@@ -361,13 +363,20 @@ impl Detached {
             }
             self.last_full = self.app.fullscreen;
         }
-        if self.last_top != self.app.always_on_top || fullscreen_changed {
+        let top_changed = self.last_top != self.app.always_on_top;
+        if top_changed || fullscreen_changed {
             self.window.set_window_level(if self.app.always_on_top {
                 WindowLevel::AlwaysOnTop
             } else {
                 WindowLevel::Normal
             });
             self.last_top = self.app.always_on_top;
+        }
+        if fullscreen_changed || (self.app.fullscreen && top_changed) {
+            set_fullscreen_composed(self.hwnd, self.app.fullscreen);
+            if fullscreen_changed {
+                self.force_present = true;
+            }
         }
         Ok(close)
     }

@@ -41,7 +41,7 @@ impl crate::app::App {
             ui.label(tr!("No diagnostic runs yet."));
         }
         egui::ScrollArea::vertical()
-            .max_height((ui.available_height() - 115.).max(65.))
+            .max_height((ui.available_height() - 150.).max(65.))
             .show(ui, |ui| {
                 for run in &state.runs {
                     ui.radio_value(
@@ -126,5 +126,64 @@ mod tests {
                 assert!(!output.shapes.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn diagnostics_receipt_fits_inside_settings_modal_with_ten_runs() {
+        fn find_text(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                    Some(text.visual_bounding_rect())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find_text(s, needle)),
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = App::new(Config::default(), None);
+        app.open_appearance();
+        app.settings_tab = Tab::Diagnostics;
+        app.diagnostics.runs = (0..10)
+            .map(|i| Run {
+                id: format!("fixture-{i}"),
+                time: format!("2026-11-25 18:2{i}:00 UTC"),
+                status: "Completed",
+            })
+            .collect();
+        app.diagnostics.result = Some(Ok(Receipt {
+            id: "87b926cf".into(),
+            timestamp: Some("2026-11-25 18:22:06 UTC".into()),
+        }));
+        let mut output = None;
+        for _ in 0..2 {
+            output = Some(ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280., 832.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.draw_dialog(ui.ctx()),
+            ));
+        }
+        let output = output.unwrap();
+        let modal = app
+            .regions
+            .iter()
+            .find(|(name, _)| name == "modal")
+            .map(|(_, rect)| *rect)
+            .expect("Settings modal bounds missing");
+        let (clip, receipt_rect) = output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                find_text(&clipped.shape, "87b926cf").map(|rect| (clipped.clip_rect, rect))
+            })
+            .expect("Report ID receipt text missing");
+        assert!(
+            receipt_rect.bottom() <= modal.bottom() - 20. && receipt_rect.bottom() <= clip.bottom(),
+            "Receipt text clipped: receipt={receipt_rect:?}, clip={clip:?}, modal={modal:?}"
+        );
     }
 }
