@@ -4,6 +4,8 @@ import {createHash, generateKeyPairSync, randomBytes, sign} from "node:crypto";
 import {fileURLToPath} from "node:url";
 import {Miniflare} from "miniflare";
 import {proofMessage, namedProofMessage, canonicalRoom} from "../src/index.js";
+import {publicKeyFromSeed, sign as signEd25519} from "../../../docs/ed25519.js";
+import {buildSignedRoomUrl, filterIceCandidate, parseInvite, sanitizeSdp} from "../../../docs/protocol.js";
 const mf = new Miniflare({modules: true, modulesRules: [{type: "ESModule", include: ["**/*.js"]}], scriptPath: fileURLToPath(new URL("../src/index.js", import.meta.url)), compatibilityDate: "2026-08-01", durableObjects: {ROOMS: {className: "Room", useSQLite: true}}, durableObjectsPersist: fileURLToPath(new URL("../../../.build/worker-tests/state", import.meta.url))});
 after(async () => mf.dispose());
 function identity() {
@@ -134,4 +136,75 @@ test("named rooms admit more devices than the former room and socket limits", {t
     }
     observer.socket.close(1000);
   }
+});
+
+test("browser query-param auth and pure-JS Ed25519 work end-to-end with Worker", async () => {
+  const seed = new Uint8Array(randomBytes(32));
+  const roomName = `web-${randomBytes(6).toString("hex")}`;
+  const signed = await buildSignedRoomUrl("wss://worker.test", roomName, seed);
+
+  // Also verify docs/ed25519.js against Node's native Ed25519 verifier.
+  const pubRaw = await publicKeyFromSeed(seed);
+  const sampleMsg = Buffer.from("p2pshare-verify-test");
+  const jsSig = await signEd25519(sampleMsg, seed);
+  const spki = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(pubRaw)]);
+  const nativeSig = sign(null, sampleMsg, {key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(seed)]), format: "der", type: "pkcs8"});
+  assert.deepEqual(Buffer.from(jsSig), nativeSig);
+  assert.equal(signed.peerId, Buffer.from(pubRaw).toString("hex"));
+  assert.equal(spki.length, 44);
+
+  const fetchUrl = signed.url.replace(/^wss:/, "https:");
+  const res = await mf.dispatchFetch(fetchUrl, {headers: {Upgrade: "websocket"}});
+  assert.equal(res.status, 101, await res.text());
+  const webSocket = res.webSocket;
+  const webNext = collect(webSocket);
+  webSocket.accept();
+  const welcome = await webNext(m => m.type === "welcome");
+  assert.equal(welcome.id, signed.peerId);
+  assert.equal(welcome.session, signed.session);
+
+  const desktop = await namedConnect(namedRoom(roomName));
+  webSocket.send(JSON.stringify({type: "name", name: "iPhone Viewer"}));
+  const members = await desktop.next(m => m.type === "members" && m.members.some(p => p.id === signed.peerId && p.name === "iPhone Viewer"));
+  assert.equal(members.members.length, 2);
+
+  webSocket.send(JSON.stringify({type: "signal", to: desktop.peer.id, to_session: welcome.members.find(m => m.id === desktop.peer.id)?.session ?? members.members.find(m => m.id === desktop.peer.id).session, kind: "offer", payload: "browser-offer"}));
+  const relayed = await desktop.next(m => m.type === "signal" && m.from === signed.peerId);
+  assert.equal(relayed.payload, "browser-offer");
+
+  // Tampered query credentials must fail with 401.
+  const tamperedRoom = new URL(fetchUrl);
+  tamperedRoom.searchParams.set("room", "other-room");
+  assert.equal((await mf.dispatchFetch(tamperedRoom.toString(), {headers: {Upgrade: "websocket"}})).status, 401);
+
+  const tamperedSig = new URL(fetchUrl);
+  tamperedSig.searchParams.set("sig", Buffer.alloc(64, 1).toString("base64url"));
+  assert.equal((await mf.dispatchFetch(tamperedSig.toString(), {headers: {Upgrade: "websocket"}})).status, 401);
+
+  webSocket.close(1000);
+  desktop.socket.close(1000);
+});
+
+test("browser ICE/SDP sanitizers and invite parser enforce P2PShare rules", () => {
+  assert.equal(filterIceCandidate("candidate:1 1 udp 2122260223 192.168.1.50 51234 typ host"), "candidate:1 1 udp 2122260223 192.168.1.50 51234 typ host");
+  assert.equal(filterIceCandidate("a=candidate:2 1 UDP 1686052607 203.0.113.5 40000 typ srflx raddr 192.168.1.50 rport 51234"), "candidate:2 1 udp 1686052607 203.0.113.5 40000 typ srflx raddr 192.168.1.50 rport 51234");
+  assert.equal(filterIceCandidate("candidate:3 1 udp 1686052607 203.0.113.5 40000 typ srflx raddr e8f1.local rport 51234"), "candidate:3 1 udp 1686052607 203.0.113.5 40000 typ srflx");
+  assert.equal(filterIceCandidate("candidate:4 1 udp 2122260223 abcd-1234.local 51234 typ host"), null);
+  assert.equal(filterIceCandidate("candidate:5 1 tcp 1518280447 192.168.1.50 9 typ host tcptype active"), null);
+  assert.equal(filterIceCandidate("candidate:6 1 udp 2122260223 0.0.0.0 51234 typ host"), null);
+  assert.equal(filterIceCandidate("candidate:7 1 udp 2122260223 224.0.0.1 51234 typ host"), null);
+  assert.equal(filterIceCandidate("candidate:8 1 udp 2122260223 2001:db8::1 51234 typ host"), "candidate:8 1 udp 2122260223 2001:db8::1 51234 typ host");
+
+  const sdp = [
+    "v=0",
+    "m=video 9 UDP/TLS/RTP/SAVPF 127",
+    "a=candidate:1 1 udp 2122260223 192.168.1.50 51234 typ host",
+    "a=candidate:2 1 udp 2122260223 fake.local 51234 typ host",
+    "a=candidate:3 1 tcp 1518280447 192.168.1.50 9 typ host tcptype active",
+    "a=mid:0",
+  ].join("\r\n");
+  assert.equal(sanitizeSdp(sdp), "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 127\r\na=candidate:1 1 udp 2122260223 192.168.1.50 51234 typ host\r\na=mid:0");
+
+  const payload = Buffer.from(JSON.stringify({version: 7, server: "wss://example.workers.dev", room: "My Room"})).toString("base64url");
+  assert.deepEqual(parseInvite(`p2pshare://room/${payload}`), {server: "wss://example.workers.dev", room: "my room"});
 });

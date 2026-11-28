@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#15161C">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="P2PShare">
+  <title>P2PShare · Watch</title>
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icon.svg">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="sidebar-scrim" class="sidebar-scrim"></div>
+
+  <div class="app-shell">
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-brand">
+        <img src="./icon.svg" alt="">
+        <span class="sidebar-brand-title">P2PShare</span>
+        <span class="badge-readonly">Viewer</span>
+      </div>
+
+      <div id="members-heading" class="sidebar-section-label">Members / 0</div>
+      <div id="member-list" class="member-list"></div>
+
+      <div class="sidebar-footer">
+        <div class="room-chip">
+          <span id="room-chip-name" class="room-chip-name"># —</span>
+          <button id="room-edit-btn" class="ghost" type="button" title="Switch room">Change</button>
+        </div>
+        <div class="profile-bar">
+          <div id="local-avatar" class="avatar">V</div>
+          <div id="local-name" class="profile-name">Viewer</div>
+          <button id="settings-btn" class="icon-btn" type="button" title="Settings" aria-label="Settings">⚙</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="mobile-topbar">
+        <button id="menu-btn" class="icon-btn" type="button" aria-label="Open members">☰</button>
+        <span id="mobile-dot" class="dot"></span>
+        <div id="mobile-room-title" class="mobile-room-title">P2PShare</div>
+        <button id="mobile-settings-btn" class="icon-btn" type="button" aria-label="Settings">⚙</button>
+      </header>
+
+      <section class="stage-wrap">
+        <div id="empty-view" class="empty-state">
+          <h2 id="empty-title">No active streams yet</h2>
+          <p id="empty-desc">Connect to your room to see shared screens here. When a friend starts sharing, their preview appears automatically.</p>
+          <button id="empty-action-btn" class="primary" type="button">Room Settings</button>
+        </div>
+
+        <div id="grid-view" class="hidden">
+          <div class="grid-header">
+            <div id="grid-heading" class="grid-title">Live streams</div>
+          </div>
+          <div id="stream-grid" class="stream-grid"></div>
+        </div>
+
+        <div id="player-view" class="player-shell hidden">
+          <div id="video-stage" class="video-stage">
+            <video id="player" autoplay playsinline webkit-playsinline></video>
+            <div id="video-waiting" class="video-overlay-msg hidden">
+              <div id="video-waiting-text">Connecting direct peer-to-peer stream…</div>
+            </div>
+            <button id="unmute-overlay-btn" class="primary unmute-banner hidden" type="button">Tap to unmute audio</button>
+          </div>
+
+          <div class="stream-footer">
+            <div class="stream-footer-meta">
+              <div id="watching-avatar" class="avatar">S</div>
+              <div class="member-meta">
+                <div id="watching-name" class="member-name">Streamer</div>
+                <div id="watching-stats" class="member-sub">—</div>
+              </div>
+            </div>
+            <div class="stream-footer-controls">
+              <button id="mute-stream-btn" type="button">Mute</button>
+              <label class="volume-wrap" title="Volume">
+                <span>Vol</span>
+                <input id="volume-slider" type="range" min="0" max="100" value="100">
+              </label>
+              <button id="fullscreen-btn" type="button">Fullscreen</button>
+              <button id="stop-watch-btn" class="primary" type="button">All screens</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="bottom-bar">
+        <button id="all-screens-btn" type="button">All screens</button>
+        <button id="mute-all-btn" type="button">Mute all</button>
+        <button id="leave-btn" class="danger" type="button">Leave room</button>
+        <div class="status-pill">
+          <span id="status-dot" class="dot"></span>
+          <span id="status-text">Not connected</span>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div id="setup-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+    <form id="setup-form" class="modal">
+      <div class="modal-header">
+        <h2 id="setup-title">Join P2PShare Room</h2>
+        <button id="modal-close-btn" class="icon-btn ghost" type="button" aria-label="Close">✕</button>
+      </div>
+
+      <div id="form-error" class="form-error hidden"></div>
+
+      <div class="field">
+        <label for="server-input">Signaling Server URL (or invite link)</label>
+        <input id="server-input" type="text" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="url" placeholder="wss://your-worker.workers.dev" required>
+        <span class="field-hint">Saved locally in this browser only. You can also paste a <code>p2pshare://room/...</code> invite.</span>
+      </div>
+
+      <div class="field">
+        <label for="name-input">Display Name</label>
+        <input id="name-input" type="text" maxlength="32" placeholder="iPhone Viewer" required>
+      </div>
+
+      <div class="field">
+        <label for="room-input">Room Name</label>
+        <input id="room-input" type="text" maxlength="64" placeholder="grupo" required>
+        <div id="recent-rooms" class="recent-chips"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="clear-cache-btn" class="ghost danger" type="button">Reset cached data</button>
+        <button id="connect-btn" class="primary" type="submit">Connect</button>
+      </div>
+    </form>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

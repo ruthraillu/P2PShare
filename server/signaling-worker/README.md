@@ -2,7 +2,7 @@
 
 P2PShare uses a Cloudflare Worker with Durable Objects for peer discovery and WebRTC SDP/ICE signaling.
 
-Windows and Android clients connect to `/v3/rooms/` to register users automatically by room name. There are no passwords or Create operations, and named rooms have no fixed participant cap. Signed device identities, session replacement, WebSocket hibernation, and directed SDP remain. Screen video stays direct encrypted WebRTC; this Worker provides no video relay or TURN. `v1` invitation connections remain for compatibility and transport regression tests, while the retired `/v2/rooms/` password endpoint returns `410`.
+Windows and Android clients connect to `/v3/rooms/` to register users automatically by room name. There are no passwords or Create operations, and named rooms have no fixed participant cap. Signed device identities, session replacement, WebSocket hibernation, and directed SDP remain. Browser clients that cannot set custom WebSocket headers may pass the same signed credentials as URL query parameters (`room`, `peer`, `session`, `ts`, `sig`, or `token` for `/v1/rooms/`). Screen video stays direct encrypted WebRTC; this Worker provides no video relay or TURN. `v1` invitation connections remain for compatibility and transport regression tests, while the retired `/v2/rooms/` password endpoint returns `410`.
 
 ## Self-hosting setup
 

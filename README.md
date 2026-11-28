@@ -25,3 +25,7 @@ The packager verifies and reuses the codec DLLs from the ZIP pinned in [codec-se
 
 [server/signaling-worker](server/signaling-worker/README.md) contains the Cloudflare Worker (Durable Objects) used for room presence and WebRTC signaling. See its [README](server/signaling-worker/README.md) for local tests (`worker.ps1 -Action Test`) and self-hosted Cloudflare deployment instructions (`worker.ps1 -Action Deploy`).
 
+## Web Viewer (Watch-Only)
+
+[docs/](docs/index.html) provides a static watch-only web client designed for browsers and mobile Safari (including iPhone Home Screen PWAs). Host it via GitHub Pages (**Settings → Pages → Build and deployment → `main` / `/docs`**) and enter your signaling server `wss://` URL and room name on first launch (stored only in your browser's `localStorage`).
+

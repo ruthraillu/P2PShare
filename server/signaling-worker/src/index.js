@@ -7,6 +7,9 @@ const MAX_MESSAGE = 65536;
 const HEARTBEAT_TIMEOUT = 30000;
 const SWEEP_INTERVAL = 15000;
 const text = new TextEncoder();
+function credential(request, url, header, param) {
+  return request.headers.get(header) ?? url.searchParams.get(param) ?? "";
+}
 function json(data, status = 200) {
   return Response.json(data, {status, headers: {"Cache-Control": "no-store"}});
 }
@@ -40,14 +43,14 @@ export default {
     if(request.method!=="GET")return json({error:"method_not_allowed"},405);
     if(request.headers.get("Upgrade")?.toLowerCase()!=="websocket")return json({error:"websocket_required"},426);
     const named=match[1]==="3",room=match[2];
-    const peer=request.headers.get("X-P2P-Peer")??"",session=request.headers.get("X-P2P-Session")??"",timestamp=request.headers.get("X-P2P-Timestamp")??"";
+    const peer=credential(request,url,"X-P2P-Peer","peer"),session=credential(request,url,"X-P2P-Session","session"),timestamp=credential(request,url,"X-P2P-Timestamp","ts"),signature=credential(request,url,"X-P2P-Signature","sig");
     try {
       if(named) {
-        const name=canonicalRoom(request.headers.get("X-P2P-Room"));
+        const name=canonicalRoom(request.headers.get("X-P2P-Room")??url.searchParams.get("room"));
         const hash=hex(await crypto.subtle.digest("SHA-256",text.encode(`P2PShare named room v1:${name}`)));
         if(hash!==room)throw new Error("room");
       }else{
-        const token=request.headers.get("Authorization")?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1];
+        const token=request.headers.get("Authorization")?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1]??url.searchParams.get("token");
         if(hex(await crypto.subtle.digest("SHA-256",fromBase64url(token,32)))!==room)throw new Error("token");
       }
       if(!/^[a-f0-9]{64}$/.test(peer)||!/^\d{10}$/.test(timestamp))throw new Error("auth");
@@ -55,7 +58,7 @@ export default {
       if(Math.abs(Date.now()/1000-Number(timestamp))>30)throw new Error("expired");
       const publicKey=Uint8Array.from(peer.match(/../g),b=>parseInt(b,16));
       const key=await crypto.subtle.importKey("raw",publicKey,{name:"Ed25519"},false,["verify"]);
-      if(!await crypto.subtle.verify("Ed25519",key,fromBase64url(request.headers.get("X-P2P-Signature"),64),text.encode(named?namedProofMessage(room,peer,session,timestamp):proofMessage(room,peer,session,timestamp))))throw new Error("signature");
+      if(!await crypto.subtle.verify("Ed25519",key,fromBase64url(signature,64),text.encode(named?namedProofMessage(room,peer,session,timestamp):proofMessage(room,peer,session,timestamp))))throw new Error("signature");
     }catch{return json({error:"unauthorized"},401);}
     // Public named rooms are independent of retired password-bound rooms.
     return env.ROOMS.get(env.ROOMS.idFromName(named?`public:${room}`:room)).fetch(request);
@@ -86,12 +89,13 @@ export class Room {
     for (const {socket} of this.members.values()) this.send(socket, data);
   }
   async fetch(request) {
-    const id = request.headers.get("X-P2P-Peer");
-    const session = request.headers.get("X-P2P-Session");
+    const url = new URL(request.url);
+    const id = credential(request, url, "X-P2P-Peer", "peer");
+    const session = credential(request, url, "X-P2P-Session", "session");
     this.sweep();
     const previous = this.members.get(id);
     if (previous?.state.session === session) return json({error: "session_replay"}, 422);
-    const named = new URL(request.url).pathname.startsWith("/v3/rooms/");
+    const named = url.pathname.startsWith("/v3/rooms/");
     if (!named) {
       if (!previous && this.members.size >= LEGACY_ROOM_LIMIT) return json({error: "room_full"}, 409);
       if (this.ctx.getWebSockets().length >= 24) return json({error: "room_busy"}, 429);
